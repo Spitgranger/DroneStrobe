@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#define ESP_INR_FLAG_DEFAULT    0
 #define LEDC_TIMER              LEDC_TIMER_0
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
 #define LEDC_OUTPUT_IO          (4) // Define the output GPIO
@@ -38,6 +39,13 @@ static SemaphoreHandle_t bin_sem;
 
 void listener(void *xStruct);
 void momentary_listener(void *xStruct);
+
+void IRAM_ATTR toggle_isr_handler(void *arg)
+{
+    
+    ((generic_data_t *)arg)->momentary_state = !((generic_data_t *)arg)->momentary_state ;
+    //ESP_LOGI("INTERR", "INTTERRIPS");
+}
 
 /* Warning:
  * For ESP32, ESP32S2, ESP32S3, ESP32C3, ESP32C2, ESP32C6, ESP32H2, ESP32P4 targets,
@@ -94,7 +102,11 @@ void app_main(void)
     // Configure GPIO pins
     set_gpio();
     example_ledc_init();
-    
+
+    // Set interrupt for both rising and falling edges
+    gpio_set_intr_type(TOGGLE, GPIO_INTR_ANYEDGE);
+    gpio_install_isr_service(ESP_INR_FLAG_DEFAULT);
+    gpio_isr_handler_add(TOGGLE, toggle_isr_handler, (void *)&TEST_DATA);
 
     xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 1, NULL);
     //xTaskCreate(momentary_listener, "ListenerMomentary", 3000, (void *)&TEST_DATA, 2, NULL);
@@ -127,10 +139,6 @@ void listener(void * xStruct) {
         uint8_t brightness_button_state = gpio_get_level(BUTTON1);
         uint8_t toggle_switch_state = gpio_get_level(TOGGLE);
         vTaskDelay(100/portTICK_PERIOD_MS);
-        if (toggle_switch_state == 1)
-        {
-            data->momentary_state = true;
-        }
         if (brightness_button_state == 1) {
             printf("%i", data->momentary_state);
             switch (data->current_state % 3) {
