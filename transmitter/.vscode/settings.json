@@ -1,0 +1,7 @@
+{
+    "idf.adapterTargetName": "esp32c6",
+    "idf.port": "/dev/ttyUSB0",
+    "files.associations": {
+        "esp_wifi_types.h": "c"
+    }
+}
