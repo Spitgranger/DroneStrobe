@@ -18,6 +18,8 @@
 #define ESP_INR_FLAG_DEFAULT    0
 
 static const char *TAG = "espnow_transmitter";
+static const char* PMK_KEY = "789eebEkksXswqwe";
+static const char* LMK_KEY = "36ddee7ae14htdi6";
 
 typedef struct Data_t {
     bool button_one_state;
@@ -44,19 +46,28 @@ void IRAM_ATTR momentary_toggle_isr_handler(void *arg)
 }
 
 void wifi_init() {
+    // ESP_ERROR_CHECK(esp_netif_init());
+    // ESP_ERROR_CHECK(esp_event_loop_create_default());
+    // esp_netif_create_default_wifi_sta();
+
+    // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    // ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    // ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // // Enable the long range protocol
+    // ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR) );
+    // ESP_ERROR_CHECK(esp_wifi_start());
+    // ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    // Enable the long range protocol
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR) );
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
+    ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
+    ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
+    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK( esp_wifi_start());
+    ESP_ERROR_CHECK( esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK( esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_LR) );
 }
 
 void espnow_send_task(void *pvParameter) {
@@ -64,10 +75,14 @@ void espnow_send_task(void *pvParameter) {
     generic_data_t *data = (generic_data_t *)pvParameter;
 
     esp_now_init();
+    esp_now_set_pmk((uint8_t *)PMK_KEY);
     esp_now_peer_info_t peer_info;
     memcpy(peer_info.peer_addr, receiver_mac, 6);
     peer_info.channel = WIFI_CHANNEL;
-    peer_info.encrypt = false;
+    for (uint8_t i = 0; i < 16; i++) {
+        peer_info.lmk[i] = LMK_KEY[i];
+    }
+    peer_info.encrypt = true;
 
     if (esp_now_add_peer(&peer_info) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add peer");
