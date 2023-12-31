@@ -12,18 +12,12 @@
 #include "driver/gpio.h"
 #include "esp_wifi_types.h"
 #include "mbedtls/aes.h"
-#include "espnow_example.h"
 #include "lora.h"
+#include "esp_mac.h"
 
 #define BUTTON1 15
 #define BUTTON2 23
 #define TOGGLE 22
-#define WIFI_CHANNEL 0
-#define RECEIVER_MAC                       \
-    {                                      \
-        0x40, 0x4C, 0xCA, 0x51, 0x57, 0xF0 \
-    }
-#define ESP_INR_FLAG_DEFAULT 0
 
 static const char *TAG = "espnow_transmitter";
 static const char *PMK_KEY = "789eebEkksXswqwe";
@@ -40,10 +34,12 @@ typedef struct Data_t
     bool button_one_state;
     bool button_two_state;
     bool toggle_state;
+    unsigned char mac[6];
+    char pairing_key[6]
     // uint64_t counter;
 } generic_data_t;
 
-static generic_data_t TEST_DATA = {0, false, false};
+static generic_data_t TEST_DATA = {0, false, false, {0}};
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
 {
@@ -192,6 +188,9 @@ void app_main()
         TEST_DATA.toggle_state = true;
     }
 
+    unsigned char mac_base[6] = {0};
+    esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
+
     /*Initialize LoRA here*/
     /*
     LoRa has the following three communication parameters.
@@ -233,6 +232,7 @@ void app_main()
     // lora_set_spreading_factor(CONFIG_SF_RATE);
     // int sf = lora_get_spreading_factor();
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
+
     xTaskCreate(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 5, NULL);
 
     xTaskCreate(&process_input, "process_input", 2048, (void *)&TEST_DATA, 6, NULL);

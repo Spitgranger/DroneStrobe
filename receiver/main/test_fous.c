@@ -15,14 +15,11 @@
 #include "esp_random.h"
 #include "esp_event.h"
 #include "esp_netif.h"
-#include "esp_wifi.h"
 #include "esp_mac.h"
-#include "esp_now.h"
-#include "esp_crc.h"
-#include "espnow_example.h"
 #include "esp_wifi_types.h"
 #include "mbedtls/aes.h"
 #include "lora.h"
+#include "esp_mac.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,11 +41,13 @@
 #define BUTTON2 23
 #define TOGGLE 22
 #define ESP_MAXDELAY 512
+#define ESP_QUEUE_SIZE 10
 
 TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
 static QueueHandle_t s_example_espnow_queue;
+static unsigned char paired_mac[6];
 
 typedef struct Data_t
 {
@@ -63,6 +62,8 @@ typedef struct received_t
     bool button_one_state;
     bool button_two_state;
     bool toggle_state;
+    unsigned char mac[6];
+    char pairing_key[6]
 } received_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, false, false, false, false};
@@ -72,6 +73,7 @@ static const char *LMK_KEY = "36ddee7ae14htdi6";
 static const char *TAG = "Prototype 1 receiever";
 
 void listener(void *xStruct);
+void print_mac(const unsigned char *mac);
 
 static void received_data_processor(void *pvParameter)
 {
@@ -83,6 +85,12 @@ static void received_data_processor(void *pvParameter)
         // If there are messages in the queue, processes them else yield the CPU back to the scheduler
         while (xQueueReceive(s_example_espnow_queue, &evt, ESP_MAXDELAY) == pdTRUE)
         {
+            if (memcmp(evt.mac, paired_mac, sizeof(evt.mac)) != 0)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                continue;
+            }
 
             if (evt.button_one_state == 1 && evt.button_two_state == 1)
             {
@@ -157,6 +165,7 @@ static void example_ledc_init(void)
 
 void lora_task_receiver(void *pvParameter)
 {
+    uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
     while (1)
@@ -168,6 +177,12 @@ void lora_task_receiver(void *pvParameter)
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
+            if (messages_received == 0)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Paired with device: [%.2X:%.2X:%.2X:%.2X:%.2X:%.2X]", evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+                memcpy(paired_mac, evt->mac, sizeof(evt->mac));
+            }
+            ++messages_received;
             if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
             {
                 ESP_LOGE(TAG, "Failed to send data to queue");
@@ -175,6 +190,11 @@ void lora_task_receiver(void *pvParameter)
         }
         vTaskDelay(50 / portTICK_PERIOD_MS); // Avoid WatchDog alerts, receieve data every 10ms
     }
+}
+
+void print_mac(const unsigned char *mac)
+{
+    printf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 void app_main(void)
@@ -217,12 +237,11 @@ void app_main(void)
     // int sf = lora_get_spreading_factor();
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
 
-    s_example_espnow_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(received_data_t));
+    s_example_espnow_queue = xQueueCreate(ESP_QUEUE_SIZE, sizeof(received_data_t));
     if (s_example_espnow_queue == NULL)
     {
         ESP_LOGE(TAG, "Create mutex fail");
     }
-
     xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 2, &listener_handle);
     xTaskCreate(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 5, &lora_receiver_handle);
     xTaskCreate(received_data_processor, "example_espnow_task", 2048, (void *)&TEST_DATA, 4, NULL);
