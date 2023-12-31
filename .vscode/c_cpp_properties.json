@@ -4,7 +4,9 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "~/Documents/Projects/esp-idf/components/**"
+                "~/Documents/Projects/esp-idf/components/**",
+                "${workspaceFolder}/receiver/components/**",
+                "${workspaceFolder}/transmitter/components/**",
             ],
             "defines": [],
             "compilerPath": "/upwdsr/bin/clang",

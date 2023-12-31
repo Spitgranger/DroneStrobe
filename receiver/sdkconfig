@@ -511,6 +511,18 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# LoRa Configuration
+#
+CONFIG_GPIO_RANGE_MAX=30
+CONFIG_MISO_GPIO=4
+CONFIG_SCK_GPIO=5
+CONFIG_MOSI_GPIO=6
+CONFIG_CS_GPIO=7
+CONFIG_RST_GPIO=3
+CONFIG_SPI2_HOST=y
+# end of LoRa Configuration
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
@@ -585,12 +597,6 @@ CONFIG_APPTRACE_LOCK_ENABLE=y
 # end of TWAI Configuration
 
 #
-# UART Configuration
-#
-# CONFIG_UART_ISR_IN_IRAM is not set
-# end of UART Configuration
-
-#
 # USB Serial/JTAG Configuration
 #
 # end of USB Serial/JTAG Configuration
@@ -607,13 +613,6 @@ CONFIG_APPTRACE_LOCK_ENABLE=y
 #
 # CONFIG_LEDC_CTRL_FUNC_IN_IRAM is not set
 # end of LEDC Configuration
-
-#
-# I2C Configuration
-#
-# CONFIG_I2C_ISR_IRAM_SAFE is not set
-# CONFIG_I2C_ENABLE_DEBUG_LOG is not set
-# end of I2C Configuration
 # end of Driver Configurations
 
 #
@@ -675,6 +674,13 @@ CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
 # end of ESP-Driver:GPTimer Configurations
 
 #
+# ESP-Driver:I2C Configurations
+#
+# CONFIG_I2C_ISR_IRAM_SAFE is not set
+# CONFIG_I2C_ENABLE_DEBUG_LOG is not set
+# end of ESP-Driver:I2C Configurations
+
+#
 # ESP-Driver:I2S Configurations
 #
 # CONFIG_I2S_ISR_IRAM_SAFE is not set
@@ -733,6 +739,12 @@ CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
 # CONFIG_TEMP_SENSOR_ENABLE_DEBUG_LOG is not set
 # CONFIG_TEMP_SENSOR_ISR_IRAM_SAFE is not set
 # end of ESP-Driver:Temperature Sensor Configurations
+
+#
+# ESP-Driver:UART Configurations
+#
+# CONFIG_UART_ISR_IN_IRAM is not set
+# end of ESP-Driver:UART Configurations
 
 #
 # Ethernet
@@ -863,12 +875,12 @@ CONFIG_PERIPH_CTRL_FUNC_IN_IRAM=y
 # end of ETM Configuration
 
 #
-# GDMA Configuration
+# GDMA Configurations
 #
 # CONFIG_GDMA_CTRL_FUNC_IN_IRAM is not set
 # CONFIG_GDMA_ISR_IRAM_SAFE is not set
 # CONFIG_GDMA_ENABLE_DEBUG_LOG is not set
-# end of GDMA Configuration
+# end of GDMA Configurations
 
 #
 # Main XTAL Config

@@ -1,6 +1,9 @@
 {
     "idf.adapterTargetName": "esp32c6",
     "files.associations": {
-        "cstdint": "c"
+        "cstdint": "c",
+        "aes.h": "c",
+        "espnow_example.h": "c",
+        "lora.h": "c"
     }
 }

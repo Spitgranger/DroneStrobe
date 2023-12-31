@@ -1,3 +1,5 @@
+// TODO implement rolling code encryption using counter
+// Note full wavelength is 32,76 cm
 #include <stdio.h>
 #include <string.h>
 
@@ -9,24 +11,37 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_wifi_types.h"
+#include "mbedtls/aes.h"
+#include "espnow_example.h"
+#include "lora.h"
 
-#define BUTTON1                 15
-#define BUTTON2                 23
-#define TOGGLE                  22
-#define WIFI_CHANNEL            0
-#define RECEIVER_MAC            {0x40, 0x4C, 0xCA, 0x51, 0x57, 0xF0}
-#define ESP_INR_FLAG_DEFAULT    0
+#define BUTTON1 15
+#define BUTTON2 23
+#define TOGGLE 22
+#define WIFI_CHANNEL 0
+#define RECEIVER_MAC                       \
+    {                                      \
+        0x40, 0x4C, 0xCA, 0x51, 0x57, 0xF0 \
+    }
+#define ESP_INR_FLAG_DEFAULT 0
 
 static const char *TAG = "espnow_transmitter";
-static const char* PMK_KEY = "789eebEkksXswqwe";
-static const char* LMK_KEY = "36ddee7ae14htdi6";
+static const char *PMK_KEY = "789eebEkksXswqwe";
+static const char *LMK_KEY = "36ddee7ae14htdi6";
+static char enc_key[32] = "12345678901234567890123456789012";
+static char enc_iv[16] = "1234567890123456";
 
-typedef struct Data_t {
+/*
+generic_data_t struct is used to store the button states and the counter used for rolling code encryption
+Counter between the receiever and transmitter must be synchronized in order to accept the message as valid
+*/
+typedef struct Data_t
+{
     bool button_one_state;
     bool button_two_state;
     bool toggle_state;
+    // uint64_t counter;
 } generic_data_t;
-
 
 static generic_data_t TEST_DATA = {0, false, false};
 
@@ -45,7 +60,43 @@ void IRAM_ATTR momentary_toggle_isr_handler(void *arg)
     ((generic_data_t *)arg)->toggle_state = !((generic_data_t *)arg)->toggle_state;
 }
 
-void wifi_init() {
+unsigned char *encrypt_any_length_string(const char *input, uint8_t *key, uint8_t *iv)
+{
+    int padded_input_len = 0;
+    int input_len = strlen(input) + 1;
+    int modulo16 = input_len % 16;
+    if (input_len < 16)
+    {
+        padded_input_len = 16;
+    }
+    else
+    {
+        padded_input_len = (strlen(input) / 16 + 1) * 16;
+    }
+
+    char *padded_input = (char *)malloc(padded_input_len);
+    if (!padded_input)
+    {
+        printf("Failed to allocate memory\n");
+        return NULL;
+    }
+    memcpy(padded_input, input, strlen(input));
+    uint8_t pkc5_value = (17 - modulo16);
+    for (int i = strlen(input); i < padded_input_len; i++)
+    {
+        padded_input[i] = pkc5_value;
+    }
+    unsigned char *encrypt_output = (unsigned char *)malloc(padded_input_len);
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 256);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_input_len, iv,
+                          (unsigned char *)padded_input, encrypt_output);
+    ESP_LOG_BUFFER_HEX("cbc_encrypt", encrypt_output, padded_input_len);
+    return encrypt_output;
+}
+void wifi_init()
+{
     // ESP_ERROR_CHECK(esp_netif_init());
     // ESP_ERROR_CHECK(esp_event_loop_create_default());
     // esp_netif_create_default_wifi_sta();
@@ -62,87 +113,35 @@ void wifi_init() {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
-    ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK( esp_wifi_start());
-    ESP_ERROR_CHECK( esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
-    ESP_ERROR_CHECK( esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_LR) );
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_LR));
 }
 
-void espnow_send_task(void *pvParameter) {
-    uint8_t receiver_mac[] = RECEIVER_MAC;
+/*
+    FreeRTOS task that handles the button presses and toggles
+    Utilizes the generic_data_t struct to store the button states and polling to update the
+    states every 50 milliseconds
+*/
+void process_input(void *pvParameter)
+{
     generic_data_t *data = (generic_data_t *)pvParameter;
-
-    esp_now_init();
-    esp_now_set_pmk((uint8_t *)PMK_KEY);
-    esp_now_peer_info_t peer_info;
-    memcpy(peer_info.peer_addr, receiver_mac, 6);
-    peer_info.channel = WIFI_CHANNEL;
-    for (uint8_t i = 0; i < 16; i++) {
-        peer_info.lmk[i] = LMK_KEY[i];
-    }
-    peer_info.encrypt = true;
-
-    if (esp_now_add_peer(&peer_info) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add peer");
-        vTaskDelete(NULL);
-    }
-
-    int sensor_value = 0;
     uint8_t brightness_button_level;
     uint8_t momentary_button_level;
     uint8_t toggle_switch_level;
-
-    while (1) {
+    // either 0, 100, 001, 010, 110, 011, 111
+    while (1)
+    {
         brightness_button_level = gpio_get_level(BUTTON1);
         momentary_button_level = gpio_get_level(BUTTON2);
         toggle_switch_level = gpio_get_level(TOGGLE);
-        if (brightness_button_level == 1 && momentary_button_level == 1 && toggle_switch_level == 1)
-        {
-            sensor_value = 7;
-        } 
-        else if(brightness_button_level == 0 && momentary_button_level == 1 && toggle_switch_level == 1)
-        {
-            sensor_value = 3;
-        }
-        else if(brightness_button_level == 0 && momentary_button_level == 0 && toggle_switch_level == 1)
-        {
-            sensor_value = 1;
-        }
-        else if(brightness_button_level == 1 && momentary_button_level == 1 && toggle_switch_level == 0)
-        {
-            sensor_value = 6;
-        }
-        else if(brightness_button_level == 0 && momentary_button_level == 1 && toggle_switch_level == 0)
-        {
-            sensor_value = 2;
-        }
-        else if(brightness_button_level == 1 && momentary_button_level == 0 && toggle_switch_level == 0)
-        {
-            sensor_value = 4;
-        } 
-        else if(brightness_button_level == 1 && momentary_button_level == 0 && toggle_switch_level == 1)
-        {
-            sensor_value = 8;
-        }
-        else {
-            sensor_value = 0;
-        }
-
-        //either 0, 100, 001, 010, 110, 011, 111
-
-        // Read sensor value or any data to be sent
-        //sensor_value = 100; // Replace this with your sensor reading logic
-
-        esp_err_t result = esp_now_send(receiver_mac, (uint8_t *)&sensor_value, sizeof(sensor_value));
-        if (result == ESP_OK) {
-            ESP_LOGI(TAG, "Data sent successfully: %d", sensor_value);
-        } else {
-            ESP_LOGE(TAG, "Error sending data");
-        }
-
-        vTaskDelay(100 / portTICK_PERIOD_MS); // Send data every 100 milliseconds
+        data->button_one_state = brightness_button_level;
+        data->button_two_state = momentary_button_level;
+        data->toggle_state = toggle_switch_level;
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
@@ -151,7 +150,7 @@ static void set_gpio()
     gpio_reset_pin(BUTTON1);
     gpio_reset_pin(BUTTON2);
     gpio_reset_pin(TOGGLE);
-    
+
     gpio_set_direction(BUTTON1, GPIO_MODE_INPUT);
     gpio_set_direction(BUTTON2, GPIO_MODE_INPUT);
     gpio_set_direction(TOGGLE, GPIO_MODE_INPUT);
@@ -163,18 +162,26 @@ static void set_gpio()
     gpio_pulldown_en(BUTTON2);
 }
 
-void app_main() {
-    set_gpio();
-    // gpio_set_intr_type(TOGGLE, GPIO_INTR_ANYEDGE);
-    // gpio_install_isr_service(ESP_INR_FLAG_DEFAULT);
-    // gpio_isr_handler_add(TOGGLE, momentary_toggle_isr_handler, (void *)&TEST_DATA);
-    
-    // // Set and install interrupt service for rising and falling edges for the momentary switch
-    // gpio_set_intr_type(BUTTON2, GPIO_INTR_POSEDGE);
-    // gpio_isr_handler_add(BUTTON2, momentary_isr_handler, (void *)&TEST_DATA);
+void lora_task_transmitter(void *pvParameter)
+{
+    ESP_LOGI(pcTaskGetName(NULL), "Start");
+    // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
+    while (1)
+    {
+        lora_send_packet((uint8_t *)pvParameter, sizeof(generic_data_t));
+        ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
+        int lost = lora_packet_lost();
+        if (lost != 0)
+        {
+            ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
 
-    // gpio_set_intr_type(BUTTON1, GPIO_INTR_POSEDGE);
-    // gpio_isr_handler_add(BUTTON2, brightness_isr_handler, (void *)&TEST_DATA);
+void app_main()
+{
+    set_gpio();
 
     if (gpio_get_level(TOGGLE) == 0)
     {
@@ -185,7 +192,48 @@ void app_main() {
         TEST_DATA.toggle_state = true;
     }
 
-    ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init();
-    xTaskCreate(&espnow_send_task, "espnow_send_task", 2048, (void *)&TEST_DATA, 5, NULL);
+    /*Initialize LoRA here*/
+    /*
+    LoRa has the following three communication parameters.
+    1.Signal Bandwidth (= BW)
+    2.Error Cording Rate (= CR)
+    3.Spreading Factor (= SF)
+    The communication speed is faster when BW is large, CR is small, and SF is small.
+    However, as the communication speed increases, the reception sensitivity deteriorates, need to select the parameters that best suit needs...
+    */
+
+    if (lora_init() == 0)
+    {
+        ESP_LOGE(pcTaskGetName(NULL), "Module is not recongnized");
+        while (1)
+        {
+            vTaskDelay(1);
+        }
+    }
+    ESP_LOGI(pcTaskGetName(NULL), "Frequency is 915MHz");
+    lora_set_frequency(915e6); // 915MHz
+
+    lora_enable_crc();
+
+    int cr = 1; // 4/5
+    int bw = 7; // 125khz
+    int sf = 7; // 7:128 chips / symbol
+
+    lora_set_coding_rate(cr);
+    // lora_set_coding_rate(CONFIG_CODING_RATE);
+    // cr = lora_get_coding_rate();
+    ESP_LOGI(pcTaskGetName(NULL), "coding_rate=%d", cr);
+
+    lora_set_bandwidth(bw);
+    // lora_set_bandwidth(CONFIG_BANDWIDTH);
+    // int bw = lora_get_bandwidth();
+    ESP_LOGI(pcTaskGetName(NULL), "bandwidth=%d", bw);
+
+    lora_set_spreading_factor(sf);
+    // lora_set_spreading_factor(CONFIG_SF_RATE);
+    // int sf = lora_get_spreading_factor();
+    ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
+    xTaskCreate(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 5, NULL);
+
+    xTaskCreate(&process_input, "process_input", 2048, (void *)&TEST_DATA, 6, NULL);
 }
