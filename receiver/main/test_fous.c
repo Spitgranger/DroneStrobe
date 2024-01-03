@@ -31,12 +31,12 @@
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
 #define LEDC_OUTPUT_IO (10) // Define the output GPIO
 #define LEDC_CHANNEL LEDC_CHANNEL_0
-#define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set duty resolution to 13 bits
-#define LEDC_DUTY (255)                // Set duty to 50%. (2 ** 13) * 50% = 4096
+#define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set duty resolution to 8 bits
+#define LEDC_DUTY (255)                // Set duty to 100%. (2 ** 8) * 100% = 255
 #define LEDC_DUTY_15 (32)
 #define LEDC_DUTY_35 (128)
 #define LEDC_DUTY_0 0
-#define LEDC_FREQUENCY (800) // Frequency in Hertz. Set frequency at 4 kHz
+#define LEDC_FREQUENCY (800) // Frequency in Hertz. Set frequency at 800 Hz
 #define BUTTON1 15
 #define BUTTON2 23
 #define TOGGLE 22
