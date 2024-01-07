@@ -1,9 +1,12 @@
 {
-    "idf.adapterTargetName": "esp32c6",
+    "idf.adapterTargetName": "esp32s3",
     "files.associations": {
         "cstdint": "c",
         "aes.h": "c",
         "espnow_example.h": "c",
         "lora.h": "c"
-    }
+    },
+    "idf.openOcdConfigs": [
+        "board/esp32s3-bridge.cfg"
+    ]
 }

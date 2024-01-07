@@ -40,7 +40,7 @@ menu "LoRa Configuration"
 		int "NSS GPIO"
 		range 0 GPIO_RANGE_MAX
 		default 15 if IDF_TARGET_ESP32
-		default 34 if IDF_TARGET_ESP32S2 || IDF_TARGET_ESP32S3
+		default 40 if IDF_TARGET_ESP32S2 || IDF_TARGET_ESP32S3
 		default  7 # C3 and others
 		help
 			Pin Number where the NCS pin of the LoRa module is connected to.

@@ -15,9 +15,9 @@
 #include "lora.h"
 #include "esp_mac.h"
 
-#define BUTTON1 15
-#define BUTTON2 23
-#define TOGGLE 22
+#define BUTTON1 4
+#define BUTTON2 5
+#define TOGGLE 6
 
 static const char *TAG = "espnow_transmitter";
 static const char *PMK_KEY = "789eebEkksXswqwe";
@@ -91,6 +91,7 @@ unsigned char *encrypt_any_length_string(const char *input, uint8_t *key, uint8_
     ESP_LOG_BUFFER_HEX("cbc_encrypt", encrypt_output, padded_input_len);
     return encrypt_output;
 }
+/* WIFI init function. Not currently used but may be useful in the future
 void wifi_init()
 {
     // ESP_ERROR_CHECK(esp_netif_init());
@@ -116,6 +117,7 @@ void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_LR));
 }
+*/
 
 /*
     FreeRTOS task that handles the button presses and toggles
@@ -128,12 +130,31 @@ void process_input(void *pvParameter)
     uint8_t brightness_button_level;
     uint8_t momentary_button_level;
     uint8_t toggle_switch_level;
+    TickType_t pressed_time = 0;
+    TickType_t released_time = 0;
+    uint8_t last_pressed = 0;
+    uint8_t current_pressed_state = 0;
     // either 0, 100, 001, 010, 110, 011, 111
     while (1)
     {
         brightness_button_level = gpio_get_level(BUTTON1);
         momentary_button_level = gpio_get_level(BUTTON2);
         toggle_switch_level = gpio_get_level(TOGGLE);
+        if (last_pressed == 1 && brightness_button_level == 0)
+        {
+            pressed_time = xTaskGetTickCount();
+        }
+        else if (last_pressed == 0 && brightness_button_level == 1)
+        {
+            released_time = xTaskGetTickCount();
+            uint32_t time_difference = released_time - pressed_time;
+            if (time_difference > pdMS_TO_TICKS(3000))
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
+            }
+        }
+        last_pressed = brightness_button_level;
+
         data->button_one_state = brightness_button_level;
         data->button_two_state = momentary_button_level;
         data->toggle_state = toggle_switch_level;
@@ -141,6 +162,10 @@ void process_input(void *pvParameter)
     }
 }
 
+/*
+    Function that initializes the GPIO pins for the buttons and toggle switch
+    Sets the direction of the pins to input and enables the pull down resistors
+*/
 static void set_gpio()
 {
     gpio_reset_pin(BUTTON1);
@@ -178,7 +203,7 @@ void lora_task_transmitter(void *pvParameter)
 void app_main()
 {
     set_gpio();
-
+    // This initializes the test data structure with the appropriate values of the toggle on start.
     if (gpio_get_level(TOGGLE) == 0)
     {
         TEST_DATA.toggle_state = false;
@@ -188,7 +213,7 @@ void app_main()
         TEST_DATA.toggle_state = true;
     }
 
-    unsigned char mac_base[6] = {0};
+    // Get the MAC of the ESP board and store it in the test data structure
     esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
 
     /*Initialize LoRA here*/
