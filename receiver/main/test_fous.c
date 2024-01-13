@@ -45,9 +45,11 @@
 
 TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
+TaskHandle_t received_data_processor_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
+static const char *PAIRING_KEY = "789eebEkksXswqwe";
 
 typedef struct Data_t
 {
@@ -63,13 +65,20 @@ typedef struct received_t
     bool button_two_state;
     bool toggle_state;
     unsigned char mac[6];
-    char pairing_key[6]
+    char pairing_key[6];
 } received_data_t;
 
-static generic_data_t TEST_DATA = {0, false, false, false, false, false, false};
+typedef struct Pairing_Data_t
+{
+    unsigned char mac[6];
+    char pairing_key[17];
+} pairing_data_t;
 
-static const char *PMK_KEY = "789eebEkksXswqwe";
-static const char *LMK_KEY = "36ddee7ae14htdi6";
+static generic_data_t TEST_DATA = {0, false, false, false};
+static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
+
+// static const char *PMK_KEY = "789eebEkksXswqwe";
+// static const char *LMK_KEY = "36ddee7ae14htdi6";
 static const char *TAG = "Prototype 1 receiever";
 
 void listener(void *xStruct);
@@ -77,6 +86,7 @@ void print_mac(const unsigned char *mac);
 
 static void received_data_processor(void *pvParameter)
 {
+    vTaskSuspend(NULL);
     received_data_t evt;
     generic_data_t *data = (generic_data_t *)pvParameter;
     // Loop to process receieved data and update the programs state
@@ -163,9 +173,53 @@ static void example_ledc_init(void)
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 }
 
+static void pairing_task(void *pvParameter)
+{
+    uint8_t buf[sizeof(pairing_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
+    while (1)
+    {
+        lora_receive(); // put into receive mode
+        if (lora_received())
+        {
+            int rxLen = lora_receive_packet(buf, sizeof(buf));
+            int rssi = lora_packet_rssi();
+            ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
+            pairing_data_t *evt = (pairing_data_t *)buf;
+            if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) != 0)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Invalid pairing key, message not read");
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                continue;
+            }
+            memcpy(paired_mac, evt->mac, sizeof(evt->mac));
+            ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
+                     evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+
+            // Send the received mac address back to the transmitter, to acknowledge the pairing
+            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+            // After pairing, flash led for 1 second
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_0));
+            // Update duty to apply the new value
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+            break;
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Avoid WatchDog alerts
+    }
+    vTaskResume(lora_receiver_handle);
+    vTaskResume(listener_handle);
+    vTaskResume(received_data_processor_handle);
+    vTaskDelete(NULL);
+}
+
 void lora_task_receiver(void *pvParameter)
 {
-    uint64_t messages_received = 0;
+    vTaskSuspend(NULL);
+    // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
     while (1)
@@ -177,12 +231,12 @@ void lora_task_receiver(void *pvParameter)
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
-            if (messages_received == 0)
-            {
-                ESP_LOGI(pcTaskGetName(NULL), "Paired with device: [%.2X:%.2X:%.2X:%.2X:%.2X:%.2X]", evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
-                memcpy(paired_mac, evt->mac, sizeof(evt->mac));
-            }
-            ++messages_received;
+            // if (messages_received == 0)
+            // {
+            //     ESP_LOGI(pcTaskGetName(NULL), "Paired with device: [%.2X:%.2X:%.2X:%.2X:%.2X:%.2X]", evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+            //     memcpy(paired_mac, evt->mac, sizeof(evt->mac));
+            // }
+            // ++messages_received;
             if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
             {
                 ESP_LOGE(TAG, "Failed to send data to queue");
@@ -197,11 +251,8 @@ void print_mac(const unsigned char *mac)
     printf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-void app_main(void)
+static void initialize_lora()
 {
-    // Initialize led pwm channel settings
-    example_ledc_init();
-
     /*
     Initialize LoRA here
     */
@@ -236,15 +287,27 @@ void app_main(void)
     // lora_set_spreading_factor(CONFIG_SF_RATE);
     // int sf = lora_get_spreading_factor();
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
+}
+
+void app_main(void)
+{
+    // Initialize led pwm channel settings
+    example_ledc_init();
+
+    // Initialize lora module
+    initialize_lora();
 
     s_example_espnow_queue = xQueueCreate(ESP_QUEUE_SIZE, sizeof(received_data_t));
     if (s_example_espnow_queue == NULL)
     {
         ESP_LOGE(TAG, "Create mutex fail");
     }
+
+    esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
+    xTaskCreate(pairing_task, "Pairing", 4096, NULL, 5, NULL);
     xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 2, &listener_handle);
     xTaskCreate(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 5, &lora_receiver_handle);
-    xTaskCreate(received_data_processor, "example_espnow_task", 2048, (void *)&TEST_DATA, 4, NULL);
+    xTaskCreate(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 4, &received_data_processor_handle);
 }
 
 // Add the control for the toggle switch to momentary;

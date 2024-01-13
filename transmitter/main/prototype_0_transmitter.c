@@ -14,16 +14,26 @@
 #include "mbedtls/aes.h"
 #include "lora.h"
 #include "esp_mac.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 
 #define BUTTON1 4
 #define BUTTON2 5
 #define TOGGLE 6
+#define PAIRING_LED 1
 
 static const char *TAG = "espnow_transmitter";
-static const char *PMK_KEY = "789eebEkksXswqwe";
-static const char *LMK_KEY = "36ddee7ae14htdi6";
-static char enc_key[32] = "12345678901234567890123456789012";
-static char enc_iv[16] = "1234567890123456";
+static const char *PAIRING_KEY = "789eebEkksXswqwe";
+// static const char *LMK_KEY = "36ddee7ae14htdi6";
+// static char enc_key[32] = "12345678901234567890123456789012";
+// static char enc_iv[16] = "1234567890123456";
+
+TaskHandle_t transmitter_task_handle;
+TaskHandle_t input_processor_task_handle;
+TaskHandle_t pairing_task_handle;
+TaskHandle_t blink_pairing_led_task_handle;
+
+SemaphoreHandle_t xSemaphore = NULL;
 
 /*
 generic_data_t struct is used to store the button states and the counter used for rolling code encryption
@@ -35,11 +45,19 @@ typedef struct Data_t
     bool button_two_state;
     bool toggle_state;
     unsigned char mac[6];
-    char pairing_key[6]
+    // char pairing_key[6]
     // uint64_t counter;
 } generic_data_t;
 
+typedef struct Pairing_Data_t
+{
+    unsigned char mac[6];
+    char pairing_key[17];
+} pairing_data_t;
+
 static generic_data_t TEST_DATA = {0, false, false, {0}};
+static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
+static bool paired = false;
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
 {
@@ -130,27 +148,30 @@ void process_input(void *pvParameter)
     uint8_t brightness_button_level;
     uint8_t momentary_button_level;
     uint8_t toggle_switch_level;
-    TickType_t pressed_time = 0;
-    TickType_t released_time = 0;
+    unsigned long pressed_time = 0;
+    unsigned long released_time = 0;
     uint8_t last_pressed = 0;
-    uint8_t current_pressed_state = 0;
     // either 0, 100, 001, 010, 110, 011, 111
     while (1)
     {
         brightness_button_level = gpio_get_level(BUTTON1);
         momentary_button_level = gpio_get_level(BUTTON2);
         toggle_switch_level = gpio_get_level(TOGGLE);
-        if (last_pressed == 1 && brightness_button_level == 0)
+        if (last_pressed == 0 && brightness_button_level == 1)
         {
-            pressed_time = xTaskGetTickCount();
+            pressed_time = esp_timer_get_time();
         }
-        else if (last_pressed == 0 && brightness_button_level == 1)
+        else if (last_pressed == 1 && brightness_button_level == 0)
         {
-            released_time = xTaskGetTickCount();
+            released_time = esp_timer_get_time();
             uint32_t time_difference = released_time - pressed_time;
-            if (time_difference > pdMS_TO_TICKS(3000))
+            if (time_difference / 1000ULL > 3000 && !paired)
             {
+                // Momentary press, enter pairing mode
                 ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
+                vTaskSuspend(transmitter_task_handle);
+                vTaskResume(pairing_task_handle);
+                vTaskSuspend(input_processor_task_handle);
             }
         }
         last_pressed = brightness_button_level;
@@ -171,10 +192,12 @@ static void set_gpio()
     gpio_reset_pin(BUTTON1);
     gpio_reset_pin(BUTTON2);
     gpio_reset_pin(TOGGLE);
+    gpio_reset_pin(PAIRING_LED);
 
     gpio_set_direction(BUTTON1, GPIO_MODE_INPUT);
     gpio_set_direction(BUTTON2, GPIO_MODE_INPUT);
     gpio_set_direction(TOGGLE, GPIO_MODE_INPUT);
+    gpio_set_direction(PAIRING_LED, GPIO_MODE_OUTPUT);
     gpio_pullup_dis(BUTTON1);
     gpio_pulldown_en(BUTTON1);
     gpio_pullup_dis(TOGGLE);
@@ -185,7 +208,7 @@ static void set_gpio()
 
 void lora_task_transmitter(void *pvParameter)
 {
-    ESP_LOGI(pcTaskGetName(NULL), "Start");
+    ESP_LOGI(pcTaskGetName(NULL), "Start transmitting button state packets...");
     // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
     while (1)
     {
@@ -200,22 +223,66 @@ void lora_task_transmitter(void *pvParameter)
     }
 }
 
-void app_main()
+void pairing_task(void *pvParameter)
 {
-    set_gpio();
-    // This initializes the test data structure with the appropriate values of the toggle on start.
-    if (gpio_get_level(TOGGLE) == 0)
+    vTaskSuspend(NULL);
+    ESP_LOGI(pcTaskGetName(NULL), "Start pairing...");
+    vTaskResume(blink_pairing_led_task_handle);
+    uint8_t buf[sizeof(pairing_data_t)];
+    while (1)
     {
-        TEST_DATA.toggle_state = false;
+        lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+        int lost = lora_packet_lost();
+        if (lost != 0)
+        {
+            ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
+        }
+        lora_receive();
+        if (lora_received())
+        {
+            int rxLen = lora_receive_packet(buf, sizeof(pairing_data_t));
+            int rssi = lora_packet_rssi();
+            ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
+            pairing_data_t *evt = (pairing_data_t *)buf;
+            if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) == 0)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
+                         evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+                paired = true;
+                break;
+            }
+        }
+        else
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "Pairing Acknolwedgement not received");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
-    else
+    vTaskResume(transmitter_task_handle);
+    vTaskResume(input_processor_task_handle);
+    vTaskDelete(NULL);
+}
+
+void blink_pairing_led_task()
+{
+    vTaskSuspend(NULL);
+    while (1)
     {
-        TEST_DATA.toggle_state = true;
+        if (paired)
+        {
+            gpio_set_level(PAIRING_LED, 1);
+            break;
+        }
+        gpio_set_level(PAIRING_LED, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        gpio_set_level(PAIRING_LED, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
+    vTaskDelete(NULL);
+}
 
-    // Get the MAC of the ESP board and store it in the test data structure
-    esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
-
+static void lora_module_setup()
+{
     /*Initialize LoRA here*/
     /*
     LoRa has the following three communication parameters.
@@ -257,8 +324,46 @@ void app_main()
     // lora_set_spreading_factor(CONFIG_SF_RATE);
     // int sf = lora_get_spreading_factor();
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
+}
 
-    xTaskCreate(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 5, NULL);
+void app_main()
+{
+    set_gpio();
+    // Initialize the pairing led off
+    gpio_set_level(PAIRING_LED, 0);
+    // This initializes the test data structure with the appropriate values of the toggle on start.
+    if (gpio_get_level(TOGGLE) == 0)
+    {
+        TEST_DATA.toggle_state = false;
+    }
+    else
+    {
+        TEST_DATA.toggle_state = true;
+    }
 
-    xTaskCreate(&process_input, "process_input", 2048, (void *)&TEST_DATA, 6, NULL);
+    xSemaphore = xSemaphoreCreateBinary();
+
+    if (xSemaphore == NULL)
+    {
+        // The semaphore was not created successfully.
+        // Handle error here.
+        ESP_LOGE(pcTaskGetName(NULL), "Failed to create semaphore");
+        return;
+    }
+
+    // Get the MAC of the ESP board and store it in the test data structure
+    esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
+    esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
+
+
+    // Setup lora module
+    lora_module_setup();
+
+    xTaskCreate(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 5, &transmitter_task_handle);
+
+    xTaskCreate(&process_input, "process_input", 2048, (void *)&TEST_DATA, 6, &input_processor_task_handle);
+
+    xTaskCreate(&pairing_task, "pairing_task", 2048, NULL, 7, &pairing_task_handle);
+
+    xTaskCreate(&blink_pairing_led_task, "pairing_task", 1024, NULL, 7, &blink_pairing_led_task_handle);
 }
