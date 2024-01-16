@@ -13,7 +13,6 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_random.h"
-#include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_wifi_types.h"
@@ -46,10 +45,13 @@
 TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
 TaskHandle_t received_data_processor_handle;
+TaskHandle_t heartbeat_sender_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
+
+SemaphoreHandle_t xSemaphore = NULL;
 
 typedef struct Data_t
 {
@@ -74,8 +76,14 @@ typedef struct Pairing_Data_t
     char pairing_key[17];
 } pairing_data_t;
 
+typedef struct Heartbeat_Data_t
+{
+    int rssi;
+} heartbeat_data_t;
+
 static generic_data_t TEST_DATA = {0, false, false, false};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
+static portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // static const char *PMK_KEY = "789eebEkksXswqwe";
 // static const char *LMK_KEY = "36ddee7ae14htdi6";
@@ -198,7 +206,6 @@ static void pairing_task(void *pvParameter)
             // Send the received mac address back to the transmitter, to acknowledge the pairing
             lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
             lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
-            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
             // After pairing, flash led for 1 second
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
@@ -213,6 +220,7 @@ static void pairing_task(void *pvParameter)
     vTaskResume(lora_receiver_handle);
     vTaskResume(listener_handle);
     vTaskResume(received_data_processor_handle);
+    vTaskResume(heartbeat_sender_handle);
     vTaskDelete(NULL);
 }
 
@@ -221,14 +229,18 @@ void lora_task_receiver(void *pvParameter)
     vTaskSuspend(NULL);
     // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
+    heartbeat_data_t data;
+
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
     while (1)
     {
+        vTaskSuspend(heartbeat_sender_handle);
         lora_receive(); // put into receive mode
         if (lora_received())
         {
             int rxLen = lora_receive_packet(buf, sizeof(received_data_t));
             int rssi = lora_packet_rssi();
+            vTaskResume(heartbeat_sender_handle);
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
             // if (messages_received == 0)
@@ -242,6 +254,7 @@ void lora_task_receiver(void *pvParameter)
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
         }
+        vTaskResume(heartbeat_sender_handle);
         vTaskDelay(50 / portTICK_PERIOD_MS); // Avoid WatchDog alerts, receieve data every 10ms
     }
 }
@@ -289,11 +302,35 @@ static void initialize_lora()
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
 }
 
+static void heartbeat_sender_task(void *pvParameter)
+{
+    vTaskSuspend(NULL);
+    ESP_LOGI(pcTaskGetName(NULL), "Start sending heartbeat");
+    heartbeat_data_t data;
+    while (1)
+    {
+        vTaskSuspend(lora_receiver_handle);
+        data.rssi = lora_packet_rssi();
+        lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
+        vTaskResume(lora_receiver_handle);
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     // Initialize led pwm channel settings
     example_ledc_init();
 
+    xSemaphore = xSemaphoreCreateBinary();
+
+    if (xSemaphore == NULL)
+    {
+        // The semaphore was not created successfully.
+        // Handle error here.
+        ESP_LOGE(pcTaskGetName(NULL), "Failed to create semaphore");
+        return;
+    }
     // Initialize lora module
     initialize_lora();
 
@@ -304,10 +341,11 @@ void app_main(void)
     }
 
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
-    xTaskCreate(pairing_task, "Pairing", 4096, NULL, 5, NULL);
+    xTaskCreate(pairing_task, "Pairing", 4096, NULL, 3, NULL);
     xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 2, &listener_handle);
     xTaskCreate(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 5, &lora_receiver_handle);
     xTaskCreate(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 4, &received_data_processor_handle);
+    xTaskCreate(heartbeat_sender_task, "Heartbeat_sender", 2048, NULL, 4, &heartbeat_sender_handle);
 }
 
 // Add the control for the toggle switch to momentary;
