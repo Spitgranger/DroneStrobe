@@ -14,7 +14,7 @@
 #include "mbedtls/aes.h"
 #include "lora.h"
 #include "esp_mac.h"
-#include "freertos/semphr.h"
+#include "freertos/semphr.h"    
 #include "esp_timer.h"
 
 #define BUTTON1 4
@@ -32,8 +32,11 @@ TaskHandle_t transmitter_task_handle;
 TaskHandle_t input_processor_task_handle;
 TaskHandle_t pairing_task_handle;
 TaskHandle_t blink_pairing_led_task_handle;
+TaskHandle_t heartbeat_receiver_task_handle;
 
 SemaphoreHandle_t xSemaphore = NULL;
+
+static QueueHandle_t heartbeat_queue = NULL;
 
 /*
 generic_data_t struct is used to store the button states and the counter used for rolling code encryption
@@ -54,6 +57,11 @@ typedef struct Pairing_Data_t
     unsigned char mac[6];
     char pairing_key[17];
 } pairing_data_t;
+
+typedef struct Heartbeat_Data_t
+{
+    int rssi;
+} heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, {0}};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
@@ -210,16 +218,29 @@ void lora_task_transmitter(void *pvParameter)
 {
     ESP_LOGI(pcTaskGetName(NULL), "Start transmitting button state packets...");
     // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
+    uint8_t buf[sizeof(heartbeat_data_t)];
     while (1)
     {
         lora_send_packet((uint8_t *)pvParameter, sizeof(generic_data_t));
-        ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
+        // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
         int lost = lora_packet_lost();
         if (lost != 0)
         {
             ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // Since the we cannot send and receive at the same time, need to listen for heartbeats immediately after sending
+        // lora_receive();
+        // if (lora_received())
+        // {
+        //     int rxLen = lora_receive_packet(buf, sizeof(generic_data_t));
+        //     // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
+        //     heartbeat_data_t *evt = (heartbeat_data_t *)buf;
+        //     if (xQueueSend(heartbeat_queue, evt, 512) != pdTRUE)
+        //     {
+        //         ESP_LOGE(pcTaskGetName(NULL), "Failed to send heartbeat data to queue");
+        //     }
+        // }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -229,7 +250,8 @@ void pairing_task(void *pvParameter)
     ESP_LOGI(pcTaskGetName(NULL), "Start pairing...");
     vTaskResume(blink_pairing_led_task_handle);
     uint8_t buf[sizeof(pairing_data_t)];
-    while (1)
+    bool received = false;
+    while (!paired)
     {
         lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
         int lost = lora_packet_lost();
@@ -260,6 +282,7 @@ void pairing_task(void *pvParameter)
     }
     vTaskResume(transmitter_task_handle);
     vTaskResume(input_processor_task_handle);
+    // vTaskResume(heartbeat_receiver_task_handle);
     vTaskDelete(NULL);
 }
 
@@ -326,6 +349,26 @@ static void lora_module_setup()
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
 }
 
+static void heartbeat_receiver_task()
+{
+    vTaskSuspend(NULL);
+    heartbeat_data_t evt;
+    unsigned long last_received_time = 0;
+    while (1)
+    {
+        while (xQueueReceive(heartbeat_queue, &evt, 512) == pdTRUE)
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "received RSSI: %d", evt.rssi);
+            last_received_time = esp_timer_get_time();
+        }
+        if ((esp_timer_get_time() - last_received_time) / 1000ULL > 10000)
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "Heartbeat not received");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void app_main()
 {
     set_gpio();
@@ -339,6 +382,14 @@ void app_main()
     else
     {
         TEST_DATA.toggle_state = true;
+    }
+
+    heartbeat_queue = xQueueCreate(10, sizeof(heartbeat_data_t));
+
+    if (heartbeat_queue == NULL)
+    {
+        ESP_LOGE(pcTaskGetName(NULL), "Failed to create queue");
+        return;
     }
 
     xSemaphore = xSemaphoreCreateBinary();
@@ -355,7 +406,6 @@ void app_main()
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
     esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
 
-
     // Setup lora module
     lora_module_setup();
 
@@ -366,4 +416,5 @@ void app_main()
     xTaskCreate(&pairing_task, "pairing_task", 2048, NULL, 7, &pairing_task_handle);
 
     xTaskCreate(&blink_pairing_led_task, "pairing_task", 1024, NULL, 7, &blink_pairing_led_task_handle);
+    // xTaskCreate(&heartbeat_receiver_task, "heartbeat_receiver_task", 1024, NULL, 2, &heartbeat_receiver_task_handle);
 }
