@@ -282,7 +282,7 @@ void pairing_task(void *pvParameter)
     }
     vTaskResume(transmitter_task_handle);
     vTaskResume(input_processor_task_handle);
-    vTaskResume(heartbeat_receiver_task_handle);
+    // vTaskResume(heartbeat_receiver_task_handle);
     vTaskDelete(NULL);
 }
 
@@ -416,5 +416,5 @@ void app_main()
     xTaskCreate(&pairing_task, "pairing_task", 2048, NULL, 7, &pairing_task_handle);
 
     xTaskCreate(&blink_pairing_led_task, "pairing_task", 1024, NULL, 7, &blink_pairing_led_task_handle);
-    xTaskCreate(&heartbeat_receiver_task, "heartbeat_receiver_task", 1024, NULL, 2, &heartbeat_receiver_task_handle);
+    // xTaskCreate(&heartbeat_receiver_task, "heartbeat_receiver_task", 1024, NULL, 2, &heartbeat_receiver_task_handle);
 }

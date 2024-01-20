@@ -220,7 +220,7 @@ static void pairing_task(void *pvParameter)
     vTaskResume(lora_receiver_handle);
     vTaskResume(listener_handle);
     vTaskResume(received_data_processor_handle);
-    vTaskResume(heartbeat_sender_handle);
+    // vTaskResume(heartbeat_sender_handle);
     vTaskDelete(NULL);
 }
 
@@ -254,7 +254,7 @@ void lora_task_receiver(void *pvParameter)
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
         }
-        vTaskResume(heartbeat_sender_handle);
+        // vTaskResume(heartbeat_sender_handle);
         vTaskDelay(50 / portTICK_PERIOD_MS); // Avoid WatchDog alerts, receieve data every 10ms
     }
 }
@@ -345,7 +345,7 @@ void app_main(void)
     xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 2, &listener_handle);
     xTaskCreate(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 5, &lora_receiver_handle);
     xTaskCreate(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 4, &received_data_processor_handle);
-    xTaskCreate(heartbeat_sender_task, "Heartbeat_sender", 2048, NULL, 4, &heartbeat_sender_handle);
+    // xTaskCreate(heartbeat_sender_task, "Heartbeat_sender", 2048, NULL, 4, &heartbeat_sender_handle);
 }
 
 // Add the control for the toggle switch to momentary;
