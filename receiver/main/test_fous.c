@@ -46,6 +46,7 @@
 TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
 TaskHandle_t received_data_processor_handle;
+TaskHandle_t heartbeat_sender_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
@@ -74,6 +75,11 @@ typedef struct Pairing_Data_t
     char pairing_key[17];
 } pairing_data_t;
 
+typedef struct Heartbeat_Data_t
+{
+    int rssi;
+} heartbeat_data_t;
+
 static generic_data_t TEST_DATA = {0, false, false, false};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
 
@@ -98,7 +104,7 @@ static void received_data_processor(void *pvParameter)
             if (memcmp(evt.mac, paired_mac, sizeof(evt.mac)) != 0)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
-                vTaskDelay(100 / portTICK_PERIOD_MS);
+                vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
 
@@ -140,7 +146,7 @@ static void received_data_processor(void *pvParameter)
             vTaskResume(listener_handle);
         }
         // Else if there are no messages in the queue, yield the CPU back to the scheduler and wait 100 for next message / connection to be reestablished
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
@@ -222,6 +228,7 @@ void lora_task_receiver(void *pvParameter)
     // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
+    unsigned long last_sent = 0;
     while (1)
     {
         lora_receive(); // put into receive mode
@@ -231,18 +238,19 @@ void lora_task_receiver(void *pvParameter)
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
-            // if (messages_received == 0)
-            // {
-            //     ESP_LOGI(pcTaskGetName(NULL), "Paired with device: [%.2X:%.2X:%.2X:%.2X:%.2X:%.2X]", evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
-            //     memcpy(paired_mac, evt->mac, sizeof(evt->mac));
-            // }
-            // ++messages_received;
             if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
             {
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS); // Avoid WatchDog alerts, receieve data every 10ms
+        if (xTaskGetTickCount() - last_sent > pdMS_TO_TICKS(10000))
+        {
+            last_sent = xTaskGetTickCount();
+            // Send heartbeat every 10 seconds
+            vTaskResume(heartbeat_sender_handle);
+            vTaskSuspend(NULL);
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Avoid WatchDog alerts, receieve data every 10ms
     }
 }
 
@@ -289,6 +297,24 @@ static void initialize_lora()
     ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
 }
 
+static void heartbeat_sender_task(void *pvParameter)
+{
+    vTaskSuspend(NULL);
+    ESP_LOGI(pcTaskGetName(NULL), "Start sending heartbeat");
+    heartbeat_data_t data;
+    while (1)
+    {
+        ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
+        data.rssi = lora_packet_rssi();
+        for (int i = 0; i < 10; i++)
+        {
+            lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
+        }
+        vTaskResume(lora_receiver_handle);
+        vTaskSuspend(NULL);
+    }
+}
+
 void app_main(void)
 {
     // Initialize led pwm channel settings
@@ -304,10 +330,11 @@ void app_main(void)
     }
 
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
-    xTaskCreate(pairing_task, "Pairing", 4096, NULL, 5, NULL);
-    xTaskCreate(listener, "Listener", 4000, (void *)&TEST_DATA, 2, &listener_handle);
-    xTaskCreate(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 5, &lora_receiver_handle);
-    xTaskCreate(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 4, &received_data_processor_handle);
+    xTaskCreatePinnedToCore(pairing_task, "Pairing", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(listener, "Listener", 4000, (void *)&TEST_DATA, 5, &listener_handle, 1);
+    xTaskCreatePinnedToCore(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 6, &lora_receiver_handle, 0);
+    xTaskCreatePinnedToCore(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 6, &received_data_processor_handle, 1);
+    xTaskCreatePinnedToCore(heartbeat_sender_task, "Heartbeat_sender", 2048, NULL, 5, &heartbeat_sender_handle, 0);
 }
 
 // Add the control for the toggle switch to momentary;
