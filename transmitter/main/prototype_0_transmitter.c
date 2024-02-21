@@ -20,7 +20,7 @@
 #define BUTTON1 4
 #define BUTTON2 5
 #define TOGGLE 6
-#define PAIRING_LED 1
+#define PAIRING_LED 11
 #define ESP_INTR_FLAG_DEFAULT 0
 
 static const char *TAG = "espnow_transmitter";
@@ -61,7 +61,8 @@ typedef struct Pairing_Data_t
 
 typedef struct Heartbeat_Data_t
 {
-    int rssi;
+    int raw_adc;
+    int voltage;
 } heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {false, false, false, {0}};
@@ -382,7 +383,6 @@ void pairing_task(void *pvParameter)
                 ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                          evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
                 paired = true;
-                break;
             }
         }
         else
@@ -468,8 +468,10 @@ data processor task resumes it.
 static void heartbeat_receiver_task()
 {
     vTaskSuspend(NULL);
-    heartbeat_data_t evt;
+    // heartbeat_data_t evt;
     uint8_t buf[sizeof(heartbeat_data_t)];
+    heartbeat_data_t *evt;
+    vTaskSuspend(NULL);
     while (1)
     {
         lora_receive(); // put into receive mode
@@ -477,8 +479,8 @@ static void heartbeat_receiver_task()
         {
             int rxLen = lora_receive_packet(buf, sizeof(heartbeat_data_t));
             int rssi = lora_packet_rssi();
-            ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-            heartbeat_data_t *evt = (heartbeat_data_t *)&buf;
+            evt = (heartbeat_data_t *)buf;
+            ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -540,6 +542,6 @@ void app_main()
 
     xTaskCreatePinnedToCore(&pairing_task, "pairing_task", 2048, NULL, 7, &pairing_task_handle, 1);
 
-    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task", 1024, NULL, 7, &blink_pairing_led_task_handle, 1);
-    xTaskCreatePinnedToCore(&heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 0);
+    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task", 1024 * 3, NULL, 7, &blink_pairing_led_task_handle, 1);
+    xTaskCreatePinnedToCore(&heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
 }

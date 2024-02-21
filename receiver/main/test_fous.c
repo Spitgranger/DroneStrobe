@@ -1,8 +1,9 @@
 /* LEDC (LED Controller) basic example
-    GPIO 4 = LED
+    GPIO 11 = LED Pairing status
     GPIO 23 = Button
     GPIO 15 = BUTTOn
     GPIO 22 = Toggle switch
+    GPIO 7  = ADC1 CHANNEL 6 PIN used for battery voltage measuring the full voltage 12.6 is divided by 5.
 */
 // TODO Debounce buttons, fix logic when momentary state is changed, implement rolling code decryption
 #include <stdio.h>
@@ -20,6 +21,8 @@
 #include "mbedtls/aes.h"
 #include "lora.h"
 #include "esp_mac.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,8 +32,10 @@
 #define ESP_INR_FLAG_DEFAULT 0
 #define LEDC_TIMER LEDC_TIMER_0
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO (10) // Define the output GPIO
+#define LEDC_OUTPUT_IO (10) // Define the output GPIO for lower power
+#define LEDC_HIGH_POWER_OUTPUT (11)
 #define LEDC_CHANNEL LEDC_CHANNEL_0
+#define LEDC_HIGH_POWER_CHANNEL LEDC_CHANNEL_1
 #define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set duty resolution to 8 bits
 #define LEDC_DUTY (255)                // Set duty to 100%. (2 ** 8) * 100% = 255
 #define LEDC_DUTY_15 (32)
@@ -42,6 +47,11 @@
 #define TOGGLE 22
 #define ESP_MAXDELAY 512
 #define ESP_QUEUE_SIZE 10
+#define BATTERY_ADC1_CHAN0 ADC_CHANNEL_6
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define BATTERY_MAX 12.6
+#define BATTERY_LOW 10.8
+#define BATTERY_MIN 9.9
 
 TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
@@ -51,6 +61,22 @@ TaskHandle_t heartbeat_sender_handle;
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
+
+// adc battery voltage monitoring
+static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
+static void example_adc_calibration_deinit(adc_cali_handle_t handle);
+static adc_oneshot_unit_handle_t adc1_handle;
+static adc_oneshot_unit_init_cfg_t init_config1 = {
+    .unit_id = ADC_UNIT_1,
+};
+//-------------ADC1 Config---------------//
+static adc_oneshot_chan_cfg_t config = {
+    .bitwidth = ADC_BITWIDTH_DEFAULT,
+    .atten = ADC_ATTEN,
+};
+//-------------ADC1 Calibration Init---------------//
+static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+static bool do_calibration1_chan0;
 
 typedef struct Data_t
 {
@@ -77,7 +103,8 @@ typedef struct Pairing_Data_t
 
 typedef struct Heartbeat_Data_t
 {
-    int rssi;
+    int adc_raw;
+    int voltage;
 } heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, false};
@@ -89,6 +116,7 @@ static const char *TAG = "Prototype 1 receiever";
 
 void listener(void *xStruct);
 void print_mac(const unsigned char *mac);
+static void adc_init();
 
 static void received_data_processor(void *pvParameter)
 {
@@ -179,6 +207,29 @@ static void example_ledc_init(void)
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 }
 
+static void high_power_ledc_init(void)
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_MODE,
+        .duty_resolution = LEDC_DUTY_RES,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_FREQUENCY, // Set output frequency at 4 kHz
+        .clk_cfg = LEDC_AUTO_CLK};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode = LEDC_MODE,
+        .channel = LEDC_HIGH_POWER_CHANNEL,
+        .timer_sel = LEDC_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .gpio_num = LEDC_HIGH_POWER_OUTPUT,
+        .duty = 0, // Set duty to 0%
+        .hpoint = 0};
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
+
 static void pairing_task(void *pvParameter)
 {
     uint8_t buf[sizeof(pairing_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
@@ -201,10 +252,11 @@ static void pairing_task(void *pvParameter)
             ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                      evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
 
-            // Send the received mac address back to the transmitter, to acknowledge the pairing
-            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
-            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
-            lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+            // Send the received mac address back to the transmitter, to acknowledge the pairing (do this 10 times to ensure that it is received)
+            for (uint8_t i = 0; i < 10; ++i)
+            {
+                lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+            }
             // After pairing, flash led for 1 second
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
@@ -302,10 +354,22 @@ static void heartbeat_sender_task(void *pvParameter)
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start sending heartbeat");
     heartbeat_data_t data;
+    int adc_raw;
+    int voltage;
+
     while (1)
     {
+        // Do a oneshot read of the 
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
+        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
+        if (do_calibration1_chan0)
+        {
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &voltage));
+            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, voltage);
+        }
         ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
-        data.rssi = lora_packet_rssi();
+        data.adc_raw = adc_raw;
+        data.voltage = voltage;
         for (int i = 0; i < 10; i++)
         {
             lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
@@ -319,6 +383,8 @@ void app_main(void)
 {
     // Initialize led pwm channel settings
     example_ledc_init();
+    high_power_ledc_init();
+    adc_init();
 
     // Initialize lora module
     initialize_lora();
@@ -334,7 +400,7 @@ void app_main(void)
     xTaskCreatePinnedToCore(listener, "Listener", 4000, (void *)&TEST_DATA, 5, &listener_handle, 1);
     xTaskCreatePinnedToCore(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 6, &lora_receiver_handle, 0);
     xTaskCreatePinnedToCore(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 6, &received_data_processor_handle, 1);
-    xTaskCreatePinnedToCore(heartbeat_sender_task, "Heartbeat_sender", 2048, NULL, 5, &heartbeat_sender_handle, 0);
+    xTaskCreatePinnedToCore(heartbeat_sender_task, "Heartbeat_sender", 1024 * 3, NULL, 5, &heartbeat_sender_handle, 0);
 }
 
 // Add the control for the toggle switch to momentary;
@@ -351,14 +417,19 @@ void listener(void *xStruct)
             while (data->strobe_state == 1)
             {
                 ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY));
+
                 // Update duty to apply the new value
                 ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
                 // Set to 0, essentially turning LED off
                 vTaskDelay(50 / portTICK_PERIOD_MS);
                 vTaskResume(lora_receiver_handle);
                 ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_0));
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_0));
                 // Update duty to apply the new value
                 ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
                 vTaskDelay(50 / portTICK_PERIOD_MS);
                 vTaskResume(lora_receiver_handle);
             }
@@ -367,8 +438,10 @@ void listener(void *xStruct)
         {
             // Set to 0, essentially turning LED off
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_0));
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_0));
             // Update duty to apply the new value
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
         }
         else if (data->on_state == 1)
         {
@@ -398,4 +471,87 @@ void listener(void *xStruct)
         }
         vTaskSuspend(NULL);
     }
+}
+
+static void adc_init()
+{
+    // Initialize unit
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    // Configure the ADC CHANNEL for GPIO 7
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BATTERY_ADC1_CHAN0, &config));
+    // Check calibration
+    do_calibration1_chan0 = example_adc_calibration_init(ADC_UNIT_1, BATTERY_ADC1_CHAN0, ADC_ATTEN, &adc1_cali_chan0_handle);
+}
+
+/*---------------------------------------------------------------
+        ADC Calibration
+---------------------------------------------------------------*/
+static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
+{
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated)
+    {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .chan = channel,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+        if (ret == ESP_OK)
+        {
+            calibrated = true;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated)
+    {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+        adc_cali_line_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+        if (ret == ESP_OK)
+        {
+            calibrated = true;
+        }
+    }
+#endif
+
+    *out_handle = handle;
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Calibration Success");
+    }
+    else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated)
+    {
+        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+
+static void example_adc_calibration_deinit(adc_cali_handle_t handle)
+{
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Curve Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(handle));
+
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Line Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle));
+#endif
 }
