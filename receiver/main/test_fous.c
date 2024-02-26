@@ -253,7 +253,7 @@ static void pairing_task(void *pvParameter)
                      evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
 
             // Send the received mac address back to the transmitter, to acknowledge the pairing (do this 10 times to ensure that it is received)
-            for (uint8_t i = 0; i < 10; ++i)
+            for (uint8_t i = 0; i < 20; ++i)
             {
                 lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
             }
@@ -295,10 +295,10 @@ void lora_task_receiver(void *pvParameter)
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
         }
-        if (xTaskGetTickCount() - last_sent > pdMS_TO_TICKS(10000))
+        if (xTaskGetTickCount() - last_sent > pdMS_TO_TICKS(30000))
         {
             last_sent = xTaskGetTickCount();
-            // Send heartbeat every 10 seconds
+            // Send heartbeat every 30 seconds
             vTaskResume(heartbeat_sender_handle);
             vTaskSuspend(NULL);
         }
@@ -359,7 +359,7 @@ static void heartbeat_sender_task(void *pvParameter)
 
     while (1)
     {
-        // Do a oneshot read of the 
+        // Do a oneshot read of the eaa
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
         ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
         if (do_calibration1_chan0)
@@ -370,7 +370,7 @@ static void heartbeat_sender_task(void *pvParameter)
         ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
         data.adc_raw = adc_raw;
         data.voltage = voltage;
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < 2; i++)
         {
             lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
         }

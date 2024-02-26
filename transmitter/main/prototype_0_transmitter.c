@@ -21,7 +21,11 @@
 #define BUTTON2 5
 #define TOGGLE 6
 #define PAIRING_LED 11
+#define BATTERY_STATUS_LED 10
 #define ESP_INTR_FLAG_DEFAULT 0
+#define BATTERY_MAX 12600
+#define BATTERY_LOW 10800
+#define BATTERY_MIN 10100
 
 static const char *TAG = "espnow_transmitter";
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
@@ -36,8 +40,7 @@ TaskHandle_t blink_pairing_led_task_handle;
 TaskHandle_t heartbeat_receiver_task_handle;
 
 SemaphoreHandle_t xSemaphore = NULL;
-
-static QueueHandle_t event_action_queue = NULL;
+SemaphoreHandle_t transmitter_semaphore = NULL;
 
 /*
 generic_data_t struct is used to store the button states and the counter used for rolling code encryption
@@ -65,23 +68,29 @@ typedef struct Heartbeat_Data_t
     int voltage;
 } heartbeat_data_t;
 
+// Static variable initialization
 static generic_data_t TEST_DATA = {false, false, false, {0}};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
 static bool paired = false;
+static QueueHandle_t event_action_queue = NULL;
+static uint64_t started = 0;
+static uint8_t battery_voltages[10] = {0};
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
 {
-    // ((generic_data_t *)arg)->button_one_state = !((generic_data_t *)arg)->button_one_state;
-    uint8_t event = 1;
+    uint8_t button_one_state = gpio_get_level(BUTTON1);
+    uint8_t button_two_state = gpio_get_level(BUTTON2);
+    uint8_t toggle_state = gpio_get_level(TOGGLE);
+    generic_data_t event;
+    event.button_one_state = button_one_state;
+    event.button_two_state = button_two_state;
+    event.toggle_state = toggle_state;
     xQueueSendFromISR(event_action_queue, &event, NULL);
-    xTaskResumeFromISR(input_processor_task_handle);
 }
 
-void IRAM_ATTR momentary_isr_handler(void *arg)
+void IRAM_ATTR button_isr_handler(void *arg)
 {
-    //((generic_data_t *)arg)->button_two_state = !((generic_data_t *)arg)->button_two_state;
-    uint8_t event = 2;
-    xQueueSendFromISR(event_action_queue, &event, NULL);
+    started = esp_timer_get_time();
     xTaskResumeFromISR(input_processor_task_handle);
 }
 
@@ -155,6 +164,102 @@ void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_LR));
 }
 */
+/*
+since individual transmission of messages is too unreliable make it like this:
+interrupt resets counter and resumes the below task, the task polls buttons for 10 seconds from the last button press
+which should do the trick
+*/
+void process_input(void *pvParameter)
+{
+    // This is the method to poll
+    generic_data_t *data = (generic_data_t *)pvParameter;
+    uint8_t brightness_button_level;
+    uint8_t momentary_button_level;
+    uint8_t toggle_switch_level;
+    unsigned long pressed_time = 0;
+    unsigned long released_time = 0;
+    uint8_t last_pressed = 0;
+    uint64_t time_difference = 0;
+    // either 0, 100, 001, 010, 110, 011, 111
+    while (1)
+    {
+        // Calculate the time elapsed between the last button press and the current time. If it's greater than
+        // 10 seconds suspend sending listening to inputs and resume listening to heartbeats
+        ESP_LOGI(pcTaskGetName(NULL), "Input processor woken up");
+        if (xSemaphore != NULL)
+        {
+            /* See if we can obtain the semaphore.  If the semaphore is not
+            available wait 10 ticks to see if it becomes free. */
+            if (xSemaphoreTake(xSemaphore, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                xSemaphoreGive(transmitter_semaphore);
+                while (1)
+                {
+                    vTaskSuspend(heartbeat_receiver_task_handle);
+                    // Increment the transmitter semaphore so it can start sending messages
+                    time_difference = esp_timer_get_time() - started;
+                    if (time_difference / 1000ULL > 10000)
+                    {
+                        if (transmitter_semaphore != NULL)
+                        {
+                            /* See if we can obtain the semaphore.  If the semaphore is not
+                            available wait 10 ticks to seidfe if it becomes free. */
+                            if (xSemaphoreTake(transmitter_semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+                            {
+                                xSemaphoreGive(xSemaphore);
+                                vTaskSuspend(transmitter_task_handle);
+                                vTaskResume(heartbeat_receiver_task_handle);
+                                break;
+                            }
+                            else
+                            {
+                                // Transmitter is not done transmitting. Wait by continuing to next iteration of loop
+                                continue;
+                            }
+                        }
+                    }
+                    vTaskResume(transmitter_task_handle);
+                    brightness_button_level = gpio_get_level(BUTTON1);
+                    momentary_button_level = gpio_get_level(BUTTON2);
+                    toggle_switch_level = gpio_get_level(TOGGLE);
+                    if (last_pressed == 0 && brightness_button_level == 1)
+                    {
+                        pressed_time = esp_timer_get_time();
+                    }
+                    else if (last_pressed == 1 && brightness_button_level == 0)
+                    {
+                        released_time = esp_timer_get_time();
+                        uint32_t time_difference = released_time - pressed_time;
+                        if (time_difference / 1000ULL > 3000 && !paired)
+                        {
+                            // Momentary press, enter pairing mode
+                            ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
+                            vTaskSuspend(transmitter_task_handle);
+                            vTaskSuspend(heartbeat_receiver_task_handle);
+                            xSemaphoreGive(xSemaphore);
+                            vTaskResume(pairing_task_handle);
+                            break;
+                            // vTaskSuspend(input_processor_task_handle);
+                        }
+                    }
+                    last_pressed = brightness_button_level;
+
+                    data->button_one_state = brightness_button_level;
+                    data->button_two_state = momentary_button_level;
+                    data->toggle_state = toggle_switch_level;
+                    xSemaphoreGive(xSemaphore);
+                    vTaskDelay(25 / portTICK_PERIOD_MS);
+                }
+                vTaskSuspend(NULL);
+            }
+        }
+        else
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "DSADJAKSDJ");
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+    }
+}
 
 /*
     FreeRTOS task that handles the button presses and toggles
@@ -174,135 +279,147 @@ void wifi_init()
 //     uint8_t last_momentary = 0;
 //     uint8_t last_brightness = 0;
 //     uint32_t time_difference = 0;
+//     generic_data_t evt;
 //     bool send = false;
 //     // either 0, 100, 001, 010, 110, 011, 111
 //     while (1)
 //     {
-//         brightness_button_level = gpio_get_level(BUTTON1);
-//         momentary_button_level = gpio_get_level(BUTTON2);
-//         toggle_switch_level = gpio_get_level(TOGGLE);
+//         while (xQueueReceive(event_action_queue, &evt, 512))
+//         {
+//             // If there's stuff in the queue it needs to be sent so suspend heartbeats
+//             vTaskSuspend(heartbeat_receiver_task_handle);
+//             brightness_button_level = evt.button_one_state;
+//             momentary_button_level = evt.button_two_state;
+//             toggle_switch_level = evt.toggle_state;
+//             ESP_LOGI(pcTaskGetName(NULL), "INPUT PROCESSOR B1 %d B2 %d, T%d", brightness_button_level, momentary_button_level, toggle_switch_level);
 
-//         if (brightness_button_level != last_brightness || momentary_button_level != last_momentary || toggle_switch_level != last_toggle)
-//         {
-//             if (brightness_button_level)
+//             if (brightness_button_level != last_brightness || momentary_button_level != last_momentary || toggle_switch_level != last_toggle)
 //             {
-//                 ESP_LOGI(pcTaskGetName(NULL), "Button 1 pressed");
+//                 if (brightness_button_level)
+//                 {
+//                     ESP_LOGI(pcTaskGetName(NULL), "Button 1 pressed");
+//                 }
+//                 if (momentary_button_level)
+//                 {
+//                     ESP_LOGI(pcTaskGetName(NULL), "Button 2 pressed");
+//                 }
+//                 if (toggle_switch_level)
+//                 {
+//                     ESP_LOGI(pcTaskGetName(NULL), "Toggle switch pressed");
+//                 }
+//                 last_brightness = brightness_button_level;
+//                 last_momentary = momentary_button_level;
+//                 last_toggle = toggle_switch_level;
+//                 send = true;
 //             }
-//             if (momentary_button_level)
+//             if (last_pressed == 0 && brightness_button_level == 1)
 //             {
-//                 ESP_LOGI(pcTaskGetName(NULL), "Button 2 pressed");
+//                 pressed_time = esp_timer_get_time();
 //             }
-//             if (toggle_switch_level)
+//             else if (last_pressed == 1 && brightness_button_level == 0)
 //             {
-//                 ESP_LOGI(pcTaskGetName(NULL), "Toggle switch pressed");
+//                 released_time = esp_timer_get_time();
+//                 time_difference = released_time - pressed_time;
+//                 if (time_difference / 1000ULL > 3000 && !paired)
+//                 {
+//                     // Momentary press, enter pairing mode
+//                     ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
+//                     // vTaskSuspend(transmitter_task_handle);
+//                     vTaskResume(pairing_task_handle);
+//                     vTaskSuspend(input_processor_task_handle);
+//                     break;
+//                 }
 //             }
-//             last_brightness = brightness_button_level;
-//             last_momentary = momentary_button_level;
-//             last_toggle = toggle_switch_level;
-//             send = true;
-//         }
-//         if (last_pressed == 0 && brightness_button_level == 1)
-//         {
-//             pressed_time = esp_timer_get_time();
-//         }
-//         else if (last_pressed == 1 && brightness_button_level == 0)
-//         {
-//             released_time = esp_timer_get_time();
-//             time_difference = released_time - pressed_time;
-//             if (time_difference / 1000ULL > 3000 && !paired)
-//             {
-//                 // Momentary press, enter pairing mode
-//                 ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
-//                 vTaskSuspend(transmitter_task_handle);
-//                 vTaskResume(pairing_task_handle);
-//                 vTaskSuspend(input_processor_task_handle);
-//             }
-//         }
-//         last_pressed = brightness_button_level;
-//         if (send)
-//         {
 //             data->button_one_state = brightness_button_level;
 //             data->button_two_state = momentary_button_level;
 //             data->toggle_state = toggle_switch_level;
-//             vTaskResume(transmitter_task_handle);
-//             send = false;
+//             last_pressed = brightness_button_level;
+//             ESP_LOGI(pcTaskGetName(NULL), "B1 %d B2 %d, T%d", ((generic_data_t *)pvParameter)->button_one_state, ((generic_data_t *)pvParameter)->button_two_state, ((generic_data_t *)pvParameter)->toggle_state);
+//             lora_send_packet((uint8_t *)pvParameter, sizeof(generic_data_t));
+//             // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
+//             int lost = lora_packet_lost();
+//             if (lost != 0)
+//             {
+//                 ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
+//             }
+//             vTaskResume(heartbeat_receiver_task_handle);
+//             // vTaskDelay(10 / portTICK_PERIOD_MS);
 //         }
-//         vTaskDelay(80 / portTICK_PERIOD_MS);
 //     }
 // }
 
-void process_input(void *pvParameter)
-{
-    generic_data_t *data = (generic_data_t *)pvParameter;
-    bool brightness_button_level = 0;
-    uint8_t momentary_button_level;
-    uint8_t toggle_switch_level;
-    unsigned long pressed_time = 0;
-    unsigned long released_time = 0;
-    uint8_t last_pressed = 0;
-    uint8_t last_toggle = 0;
-    uint8_t last_momentary = 0;
-    uint8_t current_pressed = 0;
-    uint8_t current_toggle = 0;
-    uint8_t current_momentary = 0;
-    uint8_t evt;
-    bool send = false;
-    // either 0, 100, 001, 010, 110, 011, 111
-    while (1)
-    {
-        vTaskSuspend(heartbeat_receiver_task_handle);
-        while (xQueueReceive(event_action_queue, &evt, 512))
-        {
-            switch (evt)
-            {
-            case 1:
-                ESP_LOGI(pcTaskGetName(NULL), "Button 1 pressed");
-                data->button_one_state = !data->button_one_state;
-                send = true;
-                break;
-            case 2:
-                ESP_LOGI(pcTaskGetName(NULL), "Button 2 pressed");
-                data->button_two_state = !data->button_two_state;
-                brightness_button_level = !brightness_button_level;
-                if (last_pressed == 0 && brightness_button_level == 1)
-                {
-                    pressed_time = esp_timer_get_time();
-                }
-                else if (last_pressed == 1 && brightness_button_level == 0)
-                {
-                    released_time = esp_timer_get_time();
-                    uint32_t time_difference = released_time - pressed_time;
-                    if (time_difference / 1000ULL > 3000 && !paired)
-                    {
-                        // Momentary press, enter pairing mode
-                        ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
-                        vTaskSuspend(transmitter_task_handle);
-                        vTaskResume(pairing_task_handle);
-                        vTaskSuspend(input_processor_task_handle);
-                    }
-                }
-                last_pressed = brightness_button_level;
-                send = true;
-                break;
-            case 3:
-                ESP_LOGI(pcTaskGetName(NULL), "Toggle switch pressed");
-                data->toggle_state = !data->toggle_state;
-                send = true;
-                break;
-            default:
-                break;
-            }
-            if (send)
-            {
-                vTaskResume(transmitter_task_handle);
-                send = false;
-            }
-            vTaskDelay(5 / portTICK_PERIOD_MS);
-        }
-        vTaskResume(heartbeat_receiver_task_handle);
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-}
+// void process_input(void *pvParameter)
+// {
+//     generic_data_t *data = (generic_data_t *)pvParameter;
+//     bool brightness_button_level = 0;
+//     uint8_t momentary_button_level;
+//     uint8_t toggle_switch_level;
+//     unsigned long pressed_time = 0;
+//     unsigned long released_time = 0;
+//     uint8_t last_pressed = 0;
+//     uint8_t last_toggle = 0;
+//     uint8_t last_momentary = 0;
+//     uint8_t current_pressed = 0;
+//     uint8_t current_toggle = 0;
+//     uint8_t current_momentary = 0;
+//     uint8_t evt;
+//     bool send = false;
+//     // either 0, 100, 001, 010, 110, 011, 111
+//     while (1)
+//     {
+//         vTaskSuspend(heartbeat_receiver_task_handle);
+//         while (xQueueReceive(event_action_queue, &evt, 512))
+//         {
+//             switch (evt)
+//             {
+//             case 1:
+//                 ESP_LOGI(pcTaskGetName(NULL), "Button 1 pressed");
+//                 data->button_one_state = !data->button_one_state;
+//                 send = true;
+//                 break;
+//             case 2:
+//                 ESP_LOGI(pcTaskGetName(NULL), "Button 2 pressed");
+//                 data->button_two_state = !data->button_two_state;
+//                 brightness_button_level = !brightness_button_level;
+//                 if (last_pressed == 0 && brightness_button_level == 1)
+//                 {
+//                     pressed_time = esp_timer_get_time();
+//                 }
+//                 else if (last_pressed == 1 && brightness_button_level == 0)
+//                 {
+//                     released_time = esp_timer_get_time();
+//                     uint32_t time_difference = released_time - pressed_time;
+//                     if (time_difference / 1000ULL > 3000 && !paired)
+//                     {
+//                         // Momentary press, enter pairing mode
+//                         ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
+//                         vTaskSuspend(transmitter_task_handle);
+//                         vTaskResume(pairing_task_handle);
+//                         vTaskSuspend(input_processor_task_handle);
+//                     }
+//                 }
+//                 last_pressed = brightness_button_level;
+//                 send = true;
+//                 break;
+//             case 3:
+//                 ESP_LOGI(pcTaskGetName(NULL), "Toggle switch pressed");
+//                 data->toggle_state = !data->toggle_state;
+//                 send = true;
+//                 break;
+//             default:
+//                 break;
+//             }
+//             if (send)
+//             {
+//                 vTaskResume(transmitter_task_handle);
+//                 send = false;
+//             }
+//             vTaskDelay(5 / portTICK_PERIOD_MS);
+//         }
+//         vTaskResume(heartbeat_receiver_task_handle);
+//         vTaskDelay(10 / portTICK_PERIOD_MS);
+//     }
+// }
 
 /*
     Function that initializes the GPIO pins for the buttons and toggle switch
@@ -314,11 +431,13 @@ static void set_gpio()
     gpio_reset_pin(BUTTON2);
     gpio_reset_pin(TOGGLE);
     gpio_reset_pin(PAIRING_LED);
+    gpio_reset_pin(BATTERY_STATUS_LED);
 
     gpio_set_direction(BUTTON1, GPIO_MODE_INPUT);
     gpio_set_direction(BUTTON2, GPIO_MODE_INPUT);
     gpio_set_direction(TOGGLE, GPIO_MODE_INPUT);
     gpio_set_direction(PAIRING_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BATTERY_STATUS_LED, GPIO_MODE_OUTPUT);
     gpio_pullup_dis(BUTTON1);
     gpio_pulldown_en(BUTTON1);
     gpio_pullup_dis(TOGGLE);
@@ -327,32 +446,37 @@ static void set_gpio()
     gpio_pulldown_en(BUTTON2);
 }
 
+// This task is only responsible for sending state packets to the receiver
 void lora_task_transmitter(void *pvParameter)
 {
+    vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start transmitting button state packets...");
     // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
     while (1)
     {
-        lora_send_packet((uint8_t *)pvParameter, sizeof(generic_data_t));
-        // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
-        int lost = lora_packet_lost();
-        if (lost != 0)
+        if (transmitter_semaphore != NULL)
         {
-            ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
+            /* See if we can obtain the semaphore.  If the semaphore is not
+            available wait 10 ticks to see if it becomes free. */
+            if (xSemaphoreTake(transmitter_semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Transmitting Packet");
+                lora_send_packet((uint8_t *)pvParameter, sizeof(generic_data_t));
+                // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent...", sizeof(generic_data_t));
+                int lost = lora_packet_lost();
+                if (lost != 0)
+                {
+                    ESP_LOGW(pcTaskGetName(NULL), "%d packets lost", lost);
+                }
+                // vTaskResume(heartbeat_receiver_task_handle);
+                xSemaphoreGive(transmitter_semaphore);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            else
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
-        // Since the we cannot send and receive at the same time, need to listen for heartbeats immediately after sending
-        // lora_receive();
-        // if (lora_received())
-        // {
-        //     int rxLen = lora_receive_packet(buf, sizeof(generic_data_t));
-        //     // ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-        //     heartbeat_data_t *evt = (heartbeat_data_t *)buf;
-        //     if (xQueueSend(heartbeat_queue, evt, 512) != pdTRUE)
-        //     {
-        //         ESP_LOGE(pcTaskGetName(NULL), "Failed to send heartbeat data to queue");
-        //     }
-        // }
-        vTaskSuspend(NULL);
     }
 }
 
@@ -391,9 +515,10 @@ void pairing_task(void *pvParameter)
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-    vTaskResume(transmitter_task_handle);
+    // vTaskResume(transmitter_task_handle);
+    xQueueReset(event_action_queue);
     vTaskResume(input_processor_task_handle);
-    vTaskResume(heartbeat_receiver_task_handle);
+    // vTaskResume(heartbeat_receiver_task_handle);
     vTaskDelete(NULL);
 }
 
@@ -474,15 +599,33 @@ static void heartbeat_receiver_task()
     vTaskSuspend(NULL);
     while (1)
     {
-        lora_receive(); // put into receive mode
-        if (lora_received())
+        if (xSemaphore != NULL)
         {
-            int rxLen = lora_receive_packet(buf, sizeof(heartbeat_data_t));
-            int rssi = lora_packet_rssi();
-            evt = (heartbeat_data_t *)buf;
-            ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
+            /* See if we can obtain the semaphore.  If the semaphore is not
+            available wait 50ms to see if it becomes free. */
+            if (xSemaphoreTake(xSemaphore, pdMS_TO_TICKS(50)) == pdTRUE)
+            {
+                lora_receive(); // put into receive mode
+                if (lora_received())
+                {
+                    int rxLen = lora_receive_packet(buf, sizeof(heartbeat_data_t));
+                    int rssi = lora_packet_rssi();
+                    evt = (heartbeat_data_t *)buf;
+                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
+                    if (evt->voltage < (int)(BATTERY_MIN / 5))
+                    {
+                        ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
+                        gpio_set_level(BATTERY_STATUS_LED, 1);
+                    }
+                }
+                xSemaphoreGive(xSemaphore);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            else
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -501,7 +644,7 @@ void app_main()
         TEST_DATA.toggle_state = true;
     }
 
-    event_action_queue = xQueueCreate(10, sizeof(uint8_t));
+    event_action_queue = xQueueCreate(10, sizeof(generic_data_t));
 
     if (event_action_queue == NULL)
     {
@@ -510,6 +653,7 @@ void app_main()
     }
 
     xSemaphore = xSemaphoreCreateBinary();
+    transmitter_semaphore = xSemaphoreCreateBinary();
 
     if (xSemaphore == NULL)
     {
@@ -528,20 +672,21 @@ void app_main()
     gpio_set_intr_type(TOGGLE, GPIO_INTR_ANYEDGE);
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     // hook isr handler for specific gpio pin
-    gpio_isr_handler_add(BUTTON1, brightness_isr_handler, (void *)&TEST_DATA);
+    gpio_isr_handler_add(BUTTON1, button_isr_handler, (void *)&TEST_DATA);
     // hook isr handler for specific gpio pin
-    gpio_isr_handler_add(BUTTON2, momentary_isr_handler, (void *)&TEST_DATA);
-    gpio_isr_handler_add(TOGGLE, momentary_toggle_isr_handler, (void *)&TEST_DATA);
+    gpio_isr_handler_add(BUTTON2, button_isr_handler, (void *)&TEST_DATA);
+    gpio_isr_handler_add(TOGGLE, button_isr_handler, (void *)&TEST_DATA);
 
     // Setup lora module
     lora_module_setup();
 
-    xTaskCreatePinnedToCore(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 5, &transmitter_task_handle, 1);
+    xTaskCreatePinnedToCore(&lora_task_transmitter, "TX", 1024 * 3, (void *)&TEST_DATA, 6, &transmitter_task_handle, 1);
 
-    xTaskCreatePinnedToCore(&process_input, "process_input", 4096, (void *)&TEST_DATA, 6, &input_processor_task_handle, 0);
+    xTaskCreatePinnedToCore(&process_input, "process_input", 4096, (void *)&TEST_DATA, 7, &input_processor_task_handle, 0);
 
-    xTaskCreatePinnedToCore(&pairing_task, "pairing_task", 2048, NULL, 7, &pairing_task_handle, 1);
+    xTaskCreatePinnedToCore(&pairing_task, "pairing_task", 2048, NULL, 3, &pairing_task_handle, 1);
 
-    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task", 1024 * 3, NULL, 7, &blink_pairing_led_task_handle, 1);
+    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task_blinker", 1024 * 3, NULL, 3, &blink_pairing_led_task_handle, 0);
     xTaskCreatePinnedToCore(&heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
+    xSemaphoreGive(xSemaphore);
 }
