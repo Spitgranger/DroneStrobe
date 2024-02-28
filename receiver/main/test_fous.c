@@ -23,7 +23,7 @@
 #include "esp_mac.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
-
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -61,6 +61,7 @@ TaskHandle_t heartbeat_sender_handle;
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
+static uint64_t last_brightness_press = 0;
 
 // adc battery voltage monitoring
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
@@ -105,6 +106,7 @@ typedef struct Heartbeat_Data_t
 {
     int adc_raw;
     int voltage;
+    uint8_t mac[6];
 } heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, false};
@@ -123,6 +125,7 @@ static void received_data_processor(void *pvParameter)
     vTaskSuspend(NULL);
     received_data_t evt;
     generic_data_t *data = (generic_data_t *)pvParameter;
+    uint64_t brightness_button_time_difference = 0;
     // Loop to process receieved data and update the programs state
     while (1)
     {
@@ -138,31 +141,50 @@ static void received_data_processor(void *pvParameter)
 
             if (evt.button_one_state == 1 && evt.button_two_state == 1)
             {
+                ESP_LOGI(pcTaskGetName(NULL), "Strobing");
                 data->strobe_state = true;
             }
             else if (evt.button_one_state == 0 && evt.button_two_state == 1 && evt.toggle_state == 1)
             {
+                ESP_LOGI(pcTaskGetName(NULL), "Momentary state ON LED ON");
                 data->on_state = true;
                 data->momentary_state = true;
             }
             else if (evt.button_one_state == 0 && evt.button_two_state == 0 && evt.toggle_state == 1)
             {
+                ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY STATE LED OFF");
                 data->momentary_state = true;
                 data->on_state = false;
                 data->strobe_state = false;
             }
             else if (evt.button_one_state == 1 && evt.button_two_state == 0 && evt.toggle_state == 0)
             {
-                data->on_state = true;
-                data->momentary_state = false;
-                ++data->current_state;
+                // This timeout is needed as the transmitter sends quickly (75ms) pressing the brightness button can cause the state to change to quickly.
+                brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
+                if (brightness_button_time_difference / 1000ULL > 300)
+                {
+                    ESP_LOGI(pcTaskGetName(NULL), "STATE CHANGED BRIGHTNESS");
+                    data->on_state = true;
+                    data->momentary_state = false;
+                    ++data->current_state;
+                }
+                // TODO Note if the statement below is put in the if statement above, it will change brightness every seconds instead of
+                // the user needing to release the button for at least a second to change state again same below
+                last_brightness_press = esp_timer_get_time();
             }
             else if (evt.button_one_state == 1)
             {
-                ++data->current_state;
+                brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
+                if (brightness_button_time_difference / 1000ULL > 300)
+                {
+                    ESP_LOGI(pcTaskGetName(NULL), "Brigntness state changed");
+                    ++data->current_state;
+                }
+                last_brightness_press = esp_timer_get_time();
             }
             else if (evt.button_one_state == 0 && evt.button_two_state == 0 && evt.toggle_state == 0)
             {
+                ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY MODE, LIGHTS ON");
                 data->on_state = true;
                 data->strobe_state = false;
             }
@@ -356,6 +378,7 @@ static void heartbeat_sender_task(void *pvParameter)
     heartbeat_data_t data;
     int adc_raw;
     int voltage;
+    esp_read_mac(data.mac, ESP_MAC_WIFI_STA);
 
     while (1)
     {
@@ -370,7 +393,7 @@ static void heartbeat_sender_task(void *pvParameter)
         ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
         data.adc_raw = adc_raw;
         data.voltage = voltage;
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 5; i++)
         {
             lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
         }

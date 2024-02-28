@@ -16,6 +16,8 @@
 #include "esp_mac.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
 
 #define BUTTON1 4
 #define BUTTON2 5
@@ -26,6 +28,11 @@
 #define BATTERY_MAX 12600
 #define BATTERY_LOW 10800
 #define BATTERY_MIN 10100
+#define BATTERY_ADC1_CHAN0 ADC_CHANNEL_6
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define TRANSMITTER_BATTERY_MAX 4200
+#define TRANSMITTER_BATTERY_LOW 3500
+#define TRANSMITTER_BATTERY_MIN 3200
 
 static const char *TAG = "espnow_transmitter";
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
@@ -66,7 +73,25 @@ typedef struct Heartbeat_Data_t
 {
     int raw_adc;
     int voltage;
+    uint8_t mac[6];
 } heartbeat_data_t;
+
+// adc battery voltage monitoring
+static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
+static void example_adc_calibration_deinit(adc_cali_handle_t handle);
+static void adc_init(void);
+static adc_oneshot_unit_handle_t adc1_handle;
+static adc_oneshot_unit_init_cfg_t init_config1 = {
+    .unit_id = ADC_UNIT_1,
+};
+//-------------ADC1 Config---------------//
+static adc_oneshot_chan_cfg_t config = {
+    .bitwidth = ADC_BITWIDTH_DEFAULT,
+    .atten = ADC_ATTEN,
+};
+//-------------ADC1 Calibration Init---------------//
+static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+static bool do_calibration1_chan0;
 
 // Static variable initialization
 static generic_data_t TEST_DATA = {false, false, false, {0}};
@@ -74,7 +99,7 @@ static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
 static bool paired = false;
 static QueueHandle_t event_action_queue = NULL;
 static uint64_t started = 0;
-static uint8_t battery_voltages[10] = {0};
+static uint8_t paired_receiver_mac[6] = {0};
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
 {
@@ -248,7 +273,7 @@ void process_input(void *pvParameter)
                     data->button_two_state = momentary_button_level;
                     data->toggle_state = toggle_switch_level;
                     xSemaphoreGive(xSemaphore);
-                    vTaskDelay(25 / portTICK_PERIOD_MS);
+                    vTaskDelay(75 / portTICK_PERIOD_MS);
                 }
                 vTaskSuspend(NULL);
             }
@@ -506,6 +531,7 @@ void pairing_task(void *pvParameter)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                          evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+                memcpy(paired_receiver_mac, evt->mac, sizeof(evt->mac));
                 paired = true;
             }
         }
@@ -516,7 +542,6 @@ void pairing_task(void *pvParameter)
         }
     }
     // vTaskResume(transmitter_task_handle);
-    xQueueReset(event_action_queue);
     vTaskResume(input_processor_task_handle);
     // vTaskResume(heartbeat_receiver_task_handle);
     vTaskDelete(NULL);
@@ -590,12 +615,10 @@ This task is suspended when the transmitter is sending data and resumed when the
 The default state is to always listen for heartbeats until a button is pressed, in which case the the interrupt will suspend this task until the
 data processor task resumes it.
 */
-static void heartbeat_receiver_task()
+static void heartbeat_receiver_task(void)
 {
     vTaskSuspend(NULL);
-    // heartbeat_data_t evt;
     uint8_t buf[sizeof(heartbeat_data_t)];
-    heartbeat_data_t *evt;
     vTaskSuspend(NULL);
     while (1)
     {
@@ -610,13 +633,12 @@ static void heartbeat_receiver_task()
                 {
                     int rxLen = lora_receive_packet(buf, sizeof(heartbeat_data_t));
                     int rssi = lora_packet_rssi();
-                    evt = (heartbeat_data_t *)buf;
-                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
-                    if (evt->voltage < (int)(BATTERY_MIN / 5))
+                    heartbeat_data_t *evt = (heartbeat_data_t *)buf;
+                    if (xQueueSend(event_action_queue, evt, 128) != pdTRUE)
                     {
-                        ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
-                        gpio_set_level(BATTERY_STATUS_LED, 1);
+                        ESP_LOGE(TAG, "Failed to send data to queue");
                     }
+                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
                 }
                 xSemaphoreGive(xSemaphore);
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -629,11 +651,100 @@ static void heartbeat_receiver_task()
     }
 }
 
+static void heartbeat_processor_task(void)
+{
+    vTaskSuspend(NULL);
+    heartbeat_data_t evt;
+    int receiver_battery_voltages[10] = {0};
+    int transmitter_battery_voltages[10] = {0};
+    int adc_raw;
+    int transmitter_voltage;
+    uint32_t receiver_counter = 0;
+    uint32_t transmitter_counter = 0;
+    uint16_t average_voltage = 0;
+    uint16_t average_transmitter_voltages;
+    uint8_t state = 0;
+    while (1)
+    {
+        // Receive the heartbeat containing the receivers battery voltage
+        while (xQueueReceive(event_action_queue, &evt, 128) == pdTRUE)
+        {
+            if (memcmp(evt.mac, paired_receiver_mac, sizeof(evt.mac)) != 0)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                continue;
+            }
+            if (receiver_counter < 10)
+            {
+                receiver_battery_voltages[receiver_counter] = evt.voltage;
+                ++receiver_counter;
+            }
+            else if (receiver_counter >= 10)
+            {
+                receiver_battery_voltages[receiver_counter % 10] = evt.voltage;
+                average_voltage = 0;
+                for (uint8_t i = 0; i < 10; ++i)
+                {
+                    average_voltage += receiver_battery_voltages[i];
+                }
+                if ((average_voltage / 10) < (int)(BATTERY_MIN / 5))
+                {
+                    ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
+                    state & 0x1u;
+                    gpio_set_level(BATTERY_STATUS_LED, 1);
+                }
+                else if ((average_voltage / 10) > (int)(BATTERY_MIN / 5))
+                {
+                    ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
+                    gpio_set_level(BATTERY_STATUS_LED, 0);
+                }
+            }
+        }
+        // Read the transmitters battery voltage (this has a voltage divide by 2 i.e 3.7V/2)
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
+        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
+        if (do_calibration1_chan0)
+        {
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &transmitter_voltage));
+            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, transmitter_voltage);
+        }
+        if (transmitter_counter < 10)
+        {
+            transmitter_battery_voltages[transmitter_counter] = transmitter_voltage;
+            ++transmitter_counter;
+        }
+        else if (transmitter_counter >= 10)
+        {
+            transmitter_battery_voltages[transmitter_counter % 10] = transmitter_voltage;
+            average_transmitter_voltages = 0;
+            for (uint8_t i = 0; i < 10; ++i)
+            {
+                average_transmitter_voltages += transmitter_battery_voltages[i];
+            }
+            if ((average_transmitter_voltages / 10) < (int)(TRANSMITTER_BATTERY_MIN / 2))
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "TRANSMITTER BATTERY LOW");
+                state & (0x1u << 1);
+                gpio_set_level(BATTERY_STATUS_LED, 1);
+            }
+            else if ((average_transmitter_voltages / 10) > (int)(TRANSMITTER_BATTERY_MIN / 2))
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "TRANSMITTER BATTERY OK");
+                gpio_set_level(BATTERY_STATUS_LED, 0);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+}
+
 void app_main()
 {
     set_gpio();
     // Initialize the pairing led off
     gpio_set_level(PAIRING_LED, 0);
+    adc_init();
     // This initializes the test data structure with the appropriate values of the toggle on start.
     if (gpio_get_level(TOGGLE) == 0)
     {
@@ -644,7 +755,7 @@ void app_main()
         TEST_DATA.toggle_state = true;
     }
 
-    event_action_queue = xQueueCreate(10, sizeof(generic_data_t));
+    event_action_queue = xQueueCreate(10, sizeof(heartbeat_data_t));
 
     if (event_action_queue == NULL)
     {
@@ -689,4 +800,87 @@ void app_main()
     xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task_blinker", 1024 * 3, NULL, 3, &blink_pairing_led_task_handle, 0);
     xTaskCreatePinnedToCore(&heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
     xSemaphoreGive(xSemaphore);
+}
+
+static void adc_init(void)
+{
+    // Initialize unit
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    // Configure the ADC CHANNEL for GPIO 7
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BATTERY_ADC1_CHAN0, &config));
+    // Check calibration
+    do_calibration1_chan0 = example_adc_calibration_init(ADC_UNIT_1, BATTERY_ADC1_CHAN0, ADC_ATTEN, &adc1_cali_chan0_handle);
+}
+
+/*---------------------------------------------------------------
+        ADC Calibration
+---------------------------------------------------------------*/
+static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
+{
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated)
+    {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .chan = channel,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+        if (ret == ESP_OK)
+        {
+            calibrated = true;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated)
+    {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+        adc_cali_line_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+        if (ret == ESP_OK)
+        {
+            calibrated = true;
+        }
+    }
+#endif
+
+    *out_handle = handle;
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Calibration Success");
+    }
+    else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated)
+    {
+        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+
+static void example_adc_calibration_deinit(adc_cali_handle_t handle)
+{
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Curve Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(handle));
+
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Line Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle));
+#endif
 }
