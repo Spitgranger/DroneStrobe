@@ -40,11 +40,14 @@ static const char *PAIRING_KEY = "789eebEkksXswqwe";
 // static char enc_key[32] = "12345678901234567890123456789012";
 // static char enc_iv[16] = "1234567890123456";
 
+// Task handles for freertos tasks
 TaskHandle_t transmitter_task_handle;
 TaskHandle_t input_processor_task_handle;
 TaskHandle_t pairing_task_handle;
 TaskHandle_t blink_pairing_led_task_handle;
 TaskHandle_t heartbeat_receiver_task_handle;
+TaskHandle_t voltage_status_led_task;
+TaskHandle_t heartbeat_processor_task_handle;
 
 SemaphoreHandle_t xSemaphore = NULL;
 SemaphoreHandle_t transmitter_semaphore = NULL;
@@ -100,6 +103,7 @@ static bool paired = false;
 static QueueHandle_t event_action_queue = NULL;
 static uint64_t started = 0;
 static uint8_t paired_receiver_mac[6] = {0};
+static uint8_t voltage_state = 0;
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
 {
@@ -233,6 +237,8 @@ void process_input(void *pvParameter)
                             {
                                 xSemaphoreGive(xSemaphore);
                                 vTaskSuspend(transmitter_task_handle);
+                                // vTaskResume(heartbeat_processor_task_handle);
+                                // vTaskResume(voltage_status_led_task);
                                 vTaskResume(heartbeat_receiver_task_handle);
                                 break;
                             }
@@ -615,7 +621,7 @@ This task is suspended when the transmitter is sending data and resumed when the
 The default state is to always listen for heartbeats until a button is pressed, in which case the the interrupt will suspend this task until the
 data processor task resumes it.
 */
-static void heartbeat_receiver_task(void)
+static void heartbeat_receiver_task()
 {
     vTaskSuspend(NULL);
     uint8_t buf[sizeof(heartbeat_data_t)];
@@ -651,7 +657,7 @@ static void heartbeat_receiver_task(void)
     }
 }
 
-static void heartbeat_processor_task(void)
+static void heartbeat_processor_task()
 {
     vTaskSuspend(NULL);
     heartbeat_data_t evt;
@@ -663,7 +669,6 @@ static void heartbeat_processor_task(void)
     uint32_t transmitter_counter = 0;
     uint16_t average_voltage = 0;
     uint16_t average_transmitter_voltages;
-    uint8_t state = 0;
     while (1)
     {
         // Receive the heartbeat containing the receivers battery voltage
@@ -691,13 +696,14 @@ static void heartbeat_processor_task(void)
                 if ((average_voltage / 10) < (int)(BATTERY_MIN / 5))
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
-                    state & 0x1u;
-                    gpio_set_level(BATTERY_STATUS_LED, 1);
+                    voltage_state |= 0x1u;
+                    // gpio_set_level(BATTERY_STATUS_LED, 1);
                 }
                 else if ((average_voltage / 10) > (int)(BATTERY_MIN / 5))
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
-                    gpio_set_level(BATTERY_STATUS_LED, 0);
+                    voltage_state &= ~(0x1u);
+                    // gpio_set_level(BATTERY_STATUS_LED, 0);
                 }
             }
         }
@@ -725,17 +731,51 @@ static void heartbeat_processor_task(void)
             if ((average_transmitter_voltages / 10) < (int)(TRANSMITTER_BATTERY_MIN / 2))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "TRANSMITTER BATTERY LOW");
-                state & (0x1u << 1);
-                gpio_set_level(BATTERY_STATUS_LED, 1);
+                voltage_state |= (0x1u << 1);
             }
             else if ((average_transmitter_voltages / 10) > (int)(TRANSMITTER_BATTERY_MIN / 2))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "TRANSMITTER BATTERY OK");
+                voltage_state &= ~(0x1u << 1);
                 gpio_set_level(BATTERY_STATUS_LED, 0);
             }
         }
-
         vTaskDelay(pdMS_TO_TICKS(150));
+    }
+}
+
+void set_battery_status_led_task()
+{
+    vTaskSuspend(NULL);
+    while (1)
+    {
+        // Receiver Low Voltage
+        if (voltage_state & (0x1u) && !(voltage_state & (0x1u << 1)))
+        {
+            gpio_set_level(BATTERY_STATUS_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(BATTERY_STATUS_LED, 0);
+        }
+        // Transmitter Low Voltage
+        else if (voltage_state & (0x1u << 1) && !(voltage_state & (0x1u)))
+        {
+            gpio_set_level(BATTERY_STATUS_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            gpio_set_level(BATTERY_STATUS_LED, 0);
+        }
+        // Both Low, blink fast
+        else if ((voltage_state & (0x1u << 1)) && (voltage_state & (0x1u)))
+        {
+            gpio_set_level(BATTERY_STATUS_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            gpio_set_level(BATTERY_STATUS_LED, 0);
+        }
+        else
+        {
+            // Nothing is low, shut off light
+            gpio_set_level(BATTERY_STATUS_LED, 0);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
     }
 }
 
@@ -795,10 +835,14 @@ void app_main()
 
     xTaskCreatePinnedToCore(&process_input, "process_input", 4096, (void *)&TEST_DATA, 7, &input_processor_task_handle, 0);
 
+    xTaskCreatePinnedToCore(&set_battery_status_led_task, "battery_led_status_task", 1024 * 2, NULL, 2, &voltage_status_led_task, 0);
+
+    xTaskCreatePinnedToCore(heartbeat_processor_task, "heartbeat_processor", 1024 * 4, NULL, 3, &heartbeat_processor_task_handle, 0);
+
     xTaskCreatePinnedToCore(&pairing_task, "pairing_task", 2048, NULL, 3, &pairing_task_handle, 1);
 
     xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task_blinker", 1024 * 3, NULL, 3, &blink_pairing_led_task_handle, 0);
-    xTaskCreatePinnedToCore(&heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
+    xTaskCreatePinnedToCore(heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
     xSemaphoreGive(xSemaphore);
 }
 
