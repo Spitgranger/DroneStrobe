@@ -56,11 +56,13 @@ TaskHandle_t listener_handle;
 TaskHandle_t lora_receiver_handle;
 TaskHandle_t received_data_processor_handle;
 TaskHandle_t heartbeat_sender_handle;
+TaskHandle_t voltage_reader_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
 static QueueHandle_t s_example_espnow_queue;
 static unsigned char paired_mac[6];
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
 static uint64_t last_brightness_press = 0;
+static int receiver_battery_voltages[10] = {0};
 
 // adc battery voltage monitoring
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
@@ -77,8 +79,6 @@ static adc_oneshot_chan_cfg_t config = {
 //-------------ADC1 Calibration Init---------------//
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
 static bool do_calibration1_chan0;
-
-SemaphoreHandle_t xSemaphore = NULL;
 
 typedef struct Data_t
 {
@@ -112,7 +112,6 @@ typedef struct Heartbeat_Data_t
 
 static generic_data_t TEST_DATA = {0, false, false, false};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
-static portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // static const char *PMK_KEY = "789eebEkksXswqwe";
 // static const char *LMK_KEY = "36ddee7ae14htdi6";
@@ -134,6 +133,7 @@ static void received_data_processor(void *pvParameter)
         // If there are messages in the queue, processes them else yield the CPU back to the scheduler
         while (xQueueReceive(s_example_espnow_queue, &evt, ESP_MAXDELAY) == pdTRUE)
         {
+            vTaskSuspend(voltage_reader_handle);
             if (memcmp(evt.mac, paired_mac, sizeof(evt.mac)) != 0)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
@@ -163,7 +163,7 @@ static void received_data_processor(void *pvParameter)
             {
                 // This timeout is needed as the transmitter sends quickly (75ms) pressing the brightness button can cause the state to change to quickly.
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
-                if (brightness_button_time_difference / 1000ULL > 300)
+                if (brightness_button_time_difference / 1000ULL > 100)
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "STATE CHANGED BRIGHTNESS");
                     data->on_state = true;
@@ -177,7 +177,7 @@ static void received_data_processor(void *pvParameter)
             else if (evt.button_one_state == 1)
             {
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
-                if (brightness_button_time_difference / 1000ULL > 300)
+                if (brightness_button_time_difference / 1000ULL > 100)
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "Brigntness state changed");
                     ++data->current_state;
@@ -197,6 +197,7 @@ static void received_data_processor(void *pvParameter)
             }
             vTaskResume(listener_handle);
         }
+        vTaskResume(voltage_reader_handle);
         // Else if there are no messages in the queue, yield the CPU back to the scheduler and wait 100 for next message / connection to be reestablished
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -294,6 +295,7 @@ static void pairing_task(void *pvParameter)
     vTaskResume(lora_receiver_handle);
     vTaskResume(listener_handle);
     vTaskResume(received_data_processor_handle);
+    vTaskResume(voltage_reader_handle);
     // vTaskResume(heartbeat_sender_handle);
     vTaskDelete(NULL);
 }
@@ -309,13 +311,11 @@ void lora_task_receiver(void *pvParameter)
     unsigned long last_sent = 0;
     while (1)
     {
-        vTaskSuspend(heartbeat_sender_handle);
         lora_receive(); // put into receive mode
         if (lora_received())
         {
             int rxLen = lora_receive_packet(buf, sizeof(received_data_t));
             int rssi = lora_packet_rssi();
-            vTaskResume(heartbeat_sender_handle);
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
             if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
@@ -323,7 +323,7 @@ void lora_task_receiver(void *pvParameter)
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
         }
-        if (xTaskGetTickCount() - last_sent > pdMS_TO_TICKS(30000))
+        if (xTaskGetTickCount() - last_sent > pdMS_TO_TICKS(20000))
         {
             last_sent = xTaskGetTickCount();
             // Send heartbeat every 30 seconds
@@ -382,22 +382,27 @@ static void heartbeat_sender_task(void *pvParameter)
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start sending heartbeat");
     heartbeat_data_t data;
-    int adc_raw;
     int voltage;
     esp_read_mac(data.mac, ESP_MAC_WIFI_STA);
 
     while (1)
     {
-        // Do a oneshot read of the eaa
-        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
-        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
-        if (do_calibration1_chan0)
+        voltage = 0;
+        // // Do a oneshot read of the eaa
+        // ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
+        // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
+        // if (do_calibration1_chan0)
+        // {
+        //     ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &voltage));
+        //     ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, voltage);
+        // }
+        for (uint8_t i = 0; i < 10; ++i)
         {
-            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &voltage));
-            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, voltage);
+            voltage += receiver_battery_voltages[i];
         }
+        voltage /= 10;
         ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
-        data.adc_raw = adc_raw;
+        data.adc_raw = 0;
         data.voltage = voltage;
         for (int i = 0; i < 5; i++)
         {
@@ -408,6 +413,28 @@ static void heartbeat_sender_task(void *pvParameter)
     }
 }
 
+static void voltage_reader_task()
+{
+    vTaskSuspend(NULL);
+    int counter = 0;
+    int adc_raw;
+    int voltage;
+    while (1)
+    {
+        // Do a oneshot read of the eaa
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
+        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
+        if (do_calibration1_chan0)
+        {
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &voltage));
+            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, voltage);
+            receiver_battery_voltages[counter % 10] = voltage;
+            ++counter;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 void app_main(void)
 {
     // Initialize led pwm channel settings
@@ -415,15 +442,6 @@ void app_main(void)
     high_power_ledc_init();
     adc_init();
 
-    xSemaphore = xSemaphoreCreateBinary();
-
-    if (xSemaphore == NULL)
-    {
-        // The semaphore was not created successfully.
-        // Handle error here.
-        ESP_LOGE(pcTaskGetName(NULL), "Failed to create semaphore");
-        return;
-    }
     // Initialize lora module
     initialize_lora();
 
@@ -439,6 +457,7 @@ void app_main(void)
     xTaskCreatePinnedToCore(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 6, &lora_receiver_handle, 0);
     xTaskCreatePinnedToCore(received_data_processor, "Received_data_processor", 2048, (void *)&TEST_DATA, 6, &received_data_processor_handle, 1);
     xTaskCreatePinnedToCore(heartbeat_sender_task, "Heartbeat_sender", 1024 * 3, NULL, 5, &heartbeat_sender_handle, 0);
+    xTaskCreatePinnedToCore(voltage_reader_task, "Voltage Reader", 1024 * 3, NULL, 2, &voltage_reader_handle, 1);
 }
 
 // Add the control for the toggle switch to momentary;
