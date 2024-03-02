@@ -31,7 +31,7 @@
 #define BATTERY_ADC1_CHAN0 ADC_CHANNEL_6
 #define ADC_ATTEN ADC_ATTEN_DB_12
 #define TRANSMITTER_BATTERY_MAX 4200
-#define TRANSMITTER_BATTERY_LOW 3500
+#define TRANSMITTER_BATTERY_LOW 3600
 #define TRANSMITTER_BATTERY_MIN 3200
 
 static const char *TAG = "espnow_transmitter";
@@ -224,6 +224,7 @@ void process_input(void *pvParameter)
                 xSemaphoreGive(transmitter_semaphore);
                 while (1)
                 {
+                    vTaskSuspend(heartbeat_processor_task_handle);
                     vTaskSuspend(heartbeat_receiver_task_handle);
                     // Increment the transmitter semaphore so it can start sending messages
                     time_difference = esp_timer_get_time() - started;
@@ -237,7 +238,7 @@ void process_input(void *pvParameter)
                             {
                                 xSemaphoreGive(xSemaphore);
                                 vTaskSuspend(transmitter_task_handle);
-                                // vTaskResume(heartbeat_processor_task_handle);
+                                vTaskResume(heartbeat_processor_task_handle);
                                 // vTaskResume(voltage_status_led_task);
                                 vTaskResume(heartbeat_receiver_task_handle);
                                 break;
@@ -267,6 +268,8 @@ void process_input(void *pvParameter)
                             ESP_LOGI(pcTaskGetName(NULL), "Pairing mode activated");
                             vTaskSuspend(transmitter_task_handle);
                             vTaskSuspend(heartbeat_receiver_task_handle);
+                            vTaskSuspend(heartbeat_processor_task_handle);
+                            vTaskSuspend(voltage_status_led_task);
                             xSemaphoreGive(xSemaphore);
                             vTaskResume(pairing_task_handle);
                             break;
@@ -549,6 +552,7 @@ void pairing_task(void *pvParameter)
     }
     // vTaskResume(transmitter_task_handle);
     vTaskResume(input_processor_task_handle);
+    vTaskResume(voltage_status_led_task);
     // vTaskResume(heartbeat_receiver_task_handle);
     vTaskDelete(NULL);
 }
@@ -625,7 +629,6 @@ static void heartbeat_receiver_task()
 {
     vTaskSuspend(NULL);
     uint8_t buf[sizeof(heartbeat_data_t)];
-    vTaskSuspend(NULL);
     while (1)
     {
         if (xSemaphore != NULL)
@@ -659,7 +662,6 @@ static void heartbeat_receiver_task()
 
 static void heartbeat_processor_task()
 {
-    vTaskSuspend(NULL);
     heartbeat_data_t evt;
     int receiver_battery_voltages[10] = {0};
     int transmitter_battery_voltages[10] = {0};
@@ -688,18 +690,19 @@ static void heartbeat_processor_task()
             else if (receiver_counter >= 10)
             {
                 receiver_battery_voltages[receiver_counter % 10] = evt.voltage;
+                receiver_counter++;
                 average_voltage = 0;
                 for (uint8_t i = 0; i < 10; ++i)
                 {
                     average_voltage += receiver_battery_voltages[i];
                 }
-                if ((average_voltage / 10) < (int)(BATTERY_MIN / 5))
+                if ((average_voltage / 10) < (int)(BATTERY_LOW / 5))
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
                     voltage_state |= 0x1u;
                     // gpio_set_level(BATTERY_STATUS_LED, 1);
                 }
-                else if ((average_voltage / 10) > (int)(BATTERY_MIN / 5))
+                else if ((average_voltage / 10) > (int)(BATTERY_LOW / 5))
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
                     voltage_state &= ~(0x1u);
@@ -709,11 +712,11 @@ static void heartbeat_processor_task()
         }
         // Read the transmitters battery voltage (this has a voltage divide by 2 i.e 3.7V/2)
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC1_CHAN0, &adc_raw));
-        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
+        ESP_LOGI(TAG, "TRANSMITTER ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, adc_raw);
         if (do_calibration1_chan0)
         {
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw, &transmitter_voltage));
-            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, transmitter_voltage);
+            ESP_LOGI(TAG, "TRANSMITTER ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_ADC1_CHAN0, transmitter_voltage);
         }
         if (transmitter_counter < 10)
         {
@@ -723,6 +726,7 @@ static void heartbeat_processor_task()
         else if (transmitter_counter >= 10)
         {
             transmitter_battery_voltages[transmitter_counter % 10] = transmitter_voltage;
+            transmitter_counter++;
             average_transmitter_voltages = 0;
             for (uint8_t i = 0; i < 10; ++i)
             {
@@ -737,7 +741,7 @@ static void heartbeat_processor_task()
             {
                 ESP_LOGI(pcTaskGetName(NULL), "TRANSMITTER BATTERY OK");
                 voltage_state &= ~(0x1u << 1);
-                gpio_set_level(BATTERY_STATUS_LED, 0);
+                // gpio_set_level(BATTERY_STATUS_LED, 0);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(150));
@@ -746,7 +750,6 @@ static void heartbeat_processor_task()
 
 void set_battery_status_led_task()
 {
-    vTaskSuspend(NULL);
     while (1)
     {
         // Receiver Low Voltage
@@ -754,14 +757,16 @@ void set_battery_status_led_task()
         {
             gpio_set_level(BATTERY_STATUS_LED, 1);
             vTaskDelay(pdMS_TO_TICKS(1000));
-            gpio_set_level(BATTERY_STATUS_LED, 0);
+            // gpio_set_level(BATTERY_STATUS_LED, 0);
+            // vTaskDelay(pdMS_TO_TICKS(1000));
         }
         // Transmitter Low Voltage
         else if (voltage_state & (0x1u << 1) && !(voltage_state & (0x1u)))
         {
             gpio_set_level(BATTERY_STATUS_LED, 1);
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(2000));
             gpio_set_level(BATTERY_STATUS_LED, 0);
+            vTaskDelay(pdMS_TO_TICKS(2000));
         }
         // Both Low, blink fast
         else if ((voltage_state & (0x1u << 1)) && (voltage_state & (0x1u)))
@@ -769,6 +774,7 @@ void set_battery_status_led_task()
             gpio_set_level(BATTERY_STATUS_LED, 1);
             vTaskDelay(pdMS_TO_TICKS(300));
             gpio_set_level(BATTERY_STATUS_LED, 0);
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
         else
         {
