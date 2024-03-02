@@ -14,7 +14,6 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_random.h"
-#include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_wifi_types.h"
@@ -79,6 +78,8 @@ static adc_oneshot_chan_cfg_t config = {
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
 static bool do_calibration1_chan0;
 
+SemaphoreHandle_t xSemaphore = NULL;
+
 typedef struct Data_t
 {
     uint8_t current_state;
@@ -111,6 +112,7 @@ typedef struct Heartbeat_Data_t
 
 static generic_data_t TEST_DATA = {0, false, false, false};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
+static portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // static const char *PMK_KEY = "789eebEkksXswqwe";
 // static const char *LMK_KEY = "36ddee7ae14htdi6";
@@ -273,7 +275,6 @@ static void pairing_task(void *pvParameter)
             memcpy(paired_mac, evt->mac, sizeof(evt->mac));
             ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                      evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
-
             // Send the received mac address back to the transmitter, to acknowledge the pairing (do this 10 times to ensure that it is received)
             for (uint8_t i = 0; i < 20; ++i)
             {
@@ -293,6 +294,7 @@ static void pairing_task(void *pvParameter)
     vTaskResume(lora_receiver_handle);
     vTaskResume(listener_handle);
     vTaskResume(received_data_processor_handle);
+    // vTaskResume(heartbeat_sender_handle);
     vTaskDelete(NULL);
 }
 
@@ -301,15 +303,19 @@ void lora_task_receiver(void *pvParameter)
     vTaskSuspend(NULL);
     // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
+    heartbeat_data_t data;
+
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
     unsigned long last_sent = 0;
     while (1)
     {
+        vTaskSuspend(heartbeat_sender_handle);
         lora_receive(); // put into receive mode
         if (lora_received())
         {
             int rxLen = lora_receive_packet(buf, sizeof(received_data_t));
             int rssi = lora_packet_rssi();
+            vTaskResume(heartbeat_sender_handle);
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             received_data_t *evt = (received_data_t *)buf;
             if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
@@ -409,6 +415,15 @@ void app_main(void)
     high_power_ledc_init();
     adc_init();
 
+    xSemaphore = xSemaphoreCreateBinary();
+
+    if (xSemaphore == NULL)
+    {
+        // The semaphore was not created successfully.
+        // Handle error here.
+        ESP_LOGE(pcTaskGetName(NULL), "Failed to create semaphore");
+        return;
+    }
     // Initialize lora module
     initialize_lora();
 

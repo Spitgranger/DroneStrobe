@@ -52,6 +52,8 @@ TaskHandle_t heartbeat_processor_task_handle;
 SemaphoreHandle_t xSemaphore = NULL;
 SemaphoreHandle_t transmitter_semaphore = NULL;
 
+static QueueHandle_t heartbeat_queue = NULL;
+
 /*
 generic_data_t struct is used to store the button states and the counter used for rolling code encryption
 Counter between the receiever and transmitter must be synchronized in order to accept the message as valid
@@ -486,6 +488,7 @@ void lora_task_transmitter(void *pvParameter)
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start transmitting button state packets...");
     // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
+    uint8_t buf[sizeof(heartbeat_data_t)];
     while (1)
     {
         if (transmitter_semaphore != NULL)
@@ -782,6 +785,26 @@ void set_battery_status_led_task()
             gpio_set_level(BATTERY_STATUS_LED, 0);
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
+    }
+}
+
+static void heartbeat_receiver_task()
+{
+    vTaskSuspend(NULL);
+    heartbeat_data_t evt;
+    unsigned long last_received_time = 0;
+    while (1)
+    {
+        while (xQueueReceive(heartbeat_queue, &evt, 512) == pdTRUE)
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "received RSSI: %d", evt.rssi);
+            last_received_time = esp_timer_get_time();
+        }
+        if ((esp_timer_get_time() - last_received_time) / 1000ULL > 10000)
+        {
+            ESP_LOGI(pcTaskGetName(NULL), "Heartbeat not received");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
