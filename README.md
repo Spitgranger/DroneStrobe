@@ -11,7 +11,9 @@ $ idf.py set-target esp32c6/esp32s3
 $ idf.py build
 $ idf.py -p <port to serial device> flash
 ```
-
+### Known Issues / Improvements
+- Buttons are bouncy, need to be hardware debounced or software needs to be changed.
+- Need to verify the implementation of the listener task, as interrupts are passing events to queue, may have potential implications when more than one button is pressed
 
 ### TODO
 
