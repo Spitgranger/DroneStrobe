@@ -5,7 +5,8 @@
         "aes.h": "c",
         "espnow_example.h": "c",
         "lora.h": "c",
-        "locale": "c"
+        "locale": "c",
+        "esp_mac.h": "c"
     },
     "idf.openOcdConfigs": [
         "board/esp32s3-bridge.cfg"

@@ -52,8 +52,6 @@ TaskHandle_t heartbeat_processor_task_handle;
 SemaphoreHandle_t xSemaphore = NULL;
 SemaphoreHandle_t transmitter_semaphore = NULL;
 
-static QueueHandle_t heartbeat_queue = NULL;
-
 /*
 generic_data_t struct is used to store the button states and the counter used for rolling code encryption
 Counter between the receiever and transmitter must be synchronized in order to accept the message as valid
@@ -284,14 +282,13 @@ void process_input(void *pvParameter)
                     data->button_two_state = momentary_button_level;
                     data->toggle_state = toggle_switch_level;
                     xSemaphoreGive(xSemaphore);
-                    vTaskDelay(75 / portTICK_PERIOD_MS);
+                    vTaskDelay(30 / portTICK_PERIOD_MS);
                 }
                 vTaskSuspend(NULL);
             }
         }
         else
         {
-            ESP_LOGI(pcTaskGetName(NULL), "DSADJAKSDJ");
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
     }
@@ -488,7 +485,6 @@ void lora_task_transmitter(void *pvParameter)
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start transmitting button state packets...");
     // uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255. We are sending 11 bytes.
-    uint8_t buf[sizeof(heartbeat_data_t)];
     while (1)
     {
         if (transmitter_semaphore != NULL)
@@ -672,7 +668,6 @@ static void heartbeat_processor_task()
     int transmitter_voltage;
     uint32_t receiver_counter = 0;
     uint32_t transmitter_counter = 0;
-    uint16_t average_voltage = 0;
     uint16_t average_transmitter_voltages;
     while (1)
     {
@@ -685,32 +680,18 @@ static void heartbeat_processor_task()
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
-            if (receiver_counter < 10)
+            ESP_LOGI(pcTaskGetName(NULL), "RECEIVED TRANSMITTER VOLTAGE: %d", evt.voltage);
+            if ((evt.voltage) < (int)(BATTERY_LOW / 5))
             {
-                receiver_battery_voltages[receiver_counter] = evt.voltage;
-                ++receiver_counter;
+                ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
+                voltage_state |= 0x1u;
+                // gpio_set_level(BATTERY_STATUS_LED, 1);
             }
-            else if (receiver_counter >= 10)
+            else if ((evt.voltage) > (int)(BATTERY_LOW / 5))
             {
-                receiver_battery_voltages[receiver_counter % 10] = evt.voltage;
-                receiver_counter++;
-                average_voltage = 0;
-                for (uint8_t i = 0; i < 10; ++i)
-                {
-                    average_voltage += receiver_battery_voltages[i];
-                }
-                if ((average_voltage / 10) < (int)(BATTERY_LOW / 5))
-                {
-                    ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
-                    voltage_state |= 0x1u;
-                    // gpio_set_level(BATTERY_STATUS_LED, 1);
-                }
-                else if ((average_voltage / 10) > (int)(BATTERY_LOW / 5))
-                {
-                    ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
-                    voltage_state &= ~(0x1u);
-                    // gpio_set_level(BATTERY_STATUS_LED, 0);
-                }
+                ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
+                voltage_state &= ~(0x1u);
+                // gpio_set_level(BATTERY_STATUS_LED, 0);
             }
         }
         // Read the transmitters battery voltage (this has a voltage divide by 2 i.e 3.7V/2)
@@ -785,26 +766,6 @@ void set_battery_status_led_task()
             gpio_set_level(BATTERY_STATUS_LED, 0);
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
-    }
-}
-
-static void heartbeat_receiver_task()
-{
-    vTaskSuspend(NULL);
-    heartbeat_data_t evt;
-    unsigned long last_received_time = 0;
-    while (1)
-    {
-        while (xQueueReceive(heartbeat_queue, &evt, 512) == pdTRUE)
-        {
-            ESP_LOGI(pcTaskGetName(NULL), "received RSSI: %d", evt.rssi);
-            last_received_time = esp_timer_get_time();
-        }
-        if ((esp_timer_get_time() - last_received_time) / 1000ULL > 10000)
-        {
-            ESP_LOGI(pcTaskGetName(NULL), "Heartbeat not received");
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
