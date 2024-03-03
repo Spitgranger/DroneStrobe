@@ -77,6 +77,7 @@ typedef struct Heartbeat_Data_t
     int raw_adc;
     int voltage;
     uint8_t mac[6];
+    uint8_t paired_transmitter_mac[6];
 } heartbeat_data_t;
 
 // adc battery voltage monitoring
@@ -103,6 +104,7 @@ static bool paired = false;
 static QueueHandle_t event_action_queue = NULL;
 static uint64_t started = 0;
 static uint8_t paired_receiver_mac[6] = {0};
+static uint8_t own_mac[6] = {0};
 static uint8_t voltage_state = 0;
 
 void IRAM_ATTR brightness_isr_handler(void *arg)
@@ -564,14 +566,14 @@ void blink_pairing_led_task()
         if (paired)
         {
             gpio_set_level(PAIRING_LED, 1);
-            break;
+            vTaskSuspend(NULL);
         }
         gpio_set_level(PAIRING_LED, 1);
         vTaskDelay(pdMS_TO_TICKS(500));
         gpio_set_level(PAIRING_LED, 0);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    vTaskDelete(NULL);
+    // vTaskDelete(NULL);
 }
 
 static void lora_module_setup()
@@ -626,7 +628,7 @@ data processor task resumes it.
 */
 static void heartbeat_receiver_task()
 {
-    vTaskSuspend(NULL);
+    // vTaskSuspend(NULL);
     uint8_t buf[sizeof(heartbeat_data_t)];
     while (1)
     {
@@ -674,7 +676,16 @@ static void heartbeat_processor_task()
         // Receive the heartbeat containing the receivers battery voltage
         while (xQueueReceive(event_action_queue, &evt, 128) == pdTRUE)
         {
-            if (memcmp(evt.mac, paired_receiver_mac, sizeof(evt.mac)) != 0)
+            if (memcmp(evt.paired_transmitter_mac, own_mac, sizeof(evt.mac)) == 0 && !paired)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
+                vTaskResume(blink_pairing_led_task_handle);
+                paired = true;
+                memcpy(paired_receiver_mac, evt.mac, sizeof(evt.mac));
+                vTaskResume(input_processor_task_handle);
+                vTaskDelete(pairing_task_handle);
+            }
+            else if (memcmp(evt.mac, paired_receiver_mac, sizeof(evt.mac)) != 0)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
                 vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -807,6 +818,7 @@ void app_main()
     // Get the MAC of the ESP board and store it in the test data structure
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
     esp_read_mac(TEST_DATA.mac, ESP_MAC_WIFI_STA);
+    esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
 
     gpio_set_intr_type(BUTTON1, GPIO_INTR_ANYEDGE);
     gpio_set_intr_type(BUTTON2, GPIO_INTR_ANYEDGE);
@@ -831,7 +843,7 @@ void app_main()
 
     xTaskCreatePinnedToCore(&pairing_task, "pairing_task", 2048, NULL, 3, &pairing_task_handle, 1);
 
-    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task_blinker", 1024 * 3, NULL, 3, &blink_pairing_led_task_handle, 0);
+    xTaskCreatePinnedToCore(&blink_pairing_led_task, "pairing_task_blinker", 1024 * 3, NULL, 1, &blink_pairing_led_task_handle, 0);
     xTaskCreatePinnedToCore(heartbeat_receiver_task, "heartbeat_receiver_task", 2048, NULL, 3, &heartbeat_receiver_task_handle, 1);
     xSemaphoreGive(xSemaphore);
 }

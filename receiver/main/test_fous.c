@@ -40,6 +40,7 @@
 #define LEDC_DUTY_15 (32)
 #define LEDC_DUTY_35 (128)
 #define LEDC_DUTY_0 0
+#define LEDC_DUTY_20 (51)
 #define LEDC_FREQUENCY (800) // Frequency in Hertz. Set frequency at 800 Hz
 #define BUTTON1 15
 #define BUTTON2 23
@@ -108,6 +109,7 @@ typedef struct Heartbeat_Data_t
     int adc_raw;
     int voltage;
     uint8_t mac[6];
+    uint8_t paired_transmitter_mac[6];
 } heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, false};
@@ -163,7 +165,7 @@ static void received_data_processor(void *pvParameter)
             {
                 // This timeout is needed as the transmitter sends quickly (75ms) pressing the brightness button can cause the state to change to quickly.
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
-                if (brightness_button_time_difference / 1000ULL > 100)
+                if (brightness_button_time_difference / 1000ULL > 110)
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "STATE CHANGED BRIGHTNESS");
                     data->on_state = true;
@@ -177,7 +179,7 @@ static void received_data_processor(void *pvParameter)
             else if (evt.button_one_state == 1)
             {
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
-                if (brightness_button_time_difference / 1000ULL > 100)
+                if (brightness_button_time_difference / 1000ULL > 110)
                 {
                     ESP_LOGI(pcTaskGetName(NULL), "Brigntness state changed");
                     ++data->current_state;
@@ -384,6 +386,7 @@ static void heartbeat_sender_task(void *pvParameter)
     heartbeat_data_t data;
     int voltage;
     esp_read_mac(data.mac, ESP_MAC_WIFI_STA);
+    memcpy(data.paired_transmitter_mac, paired_mac, sizeof(paired_mac));
 
     while (1)
     {
@@ -502,6 +505,8 @@ void listener(void *xStruct)
         }
         else if (data->on_state == 1)
         {
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_20));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
             switch (data->current_state % 3)
             {
             case 0:
