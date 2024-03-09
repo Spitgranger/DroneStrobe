@@ -1,7 +1,7 @@
 #include <string.h>
 #include "Message.h"
 
-void build_transmission_message(generic_data_t *data)
+void build_transmission_message(received_data_t *data)
 {
     // State byte stores the information related to the button states
     // LSB (Right most) is equal to button b
@@ -44,7 +44,7 @@ void build_pairing_message(const char *pairing_key)
     message[0] = 1;
 }
 
-void build_heartbeat_message(int voltage)
+void build_heartbeat_messages(int voltage)
 {
     message[14] = (voltage >> 24) & 0xFF;
     message[15] = (voltage >> 16) & 0xFF;

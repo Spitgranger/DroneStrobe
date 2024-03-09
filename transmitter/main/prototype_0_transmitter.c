@@ -251,11 +251,11 @@ void pairing_task(void *pvParameter)
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start pairing...");
     vTaskResume(blink_pairing_led_task_handle);
-    uint8_t buf[sizeof(pairing_data_t)];
-    bool received = false;
+    uint8_t buf[sizeof(message)];
     while (!paired)
     {
-        lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+        build_pairing_message(PAIRING_KEY);
+        lora_send_packet(message, sizeof(message));
         int lost = lora_packet_lost();
         if (lost != 0)
         {
@@ -264,18 +264,15 @@ void pairing_task(void *pvParameter)
         lora_receive();
         if (lora_received())
         {
-            int rxLen = lora_receive_packet(buf, sizeof(pairing_data_t));
+            int rxLen = lora_receive_packet(buf, sizeof(message));
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-            pairing_data_t *evt = (pairing_data_t *)buf;
-            if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) == 0)
+            if (memcmp(buf + 14, PAIRING_KEY, 16) == 0 && buf[0] == 1)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
-                         evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
-                memcpy(paired_receiver_mac, evt->mac, sizeof(evt->mac));
-                memcpy(message + 7, evt->mac, 6);
-                // Copy into the sent message struct. Used to repair in the case of a disconnection
-                memcpy(paired_receiver_mac, TEST_DATA.mac, sizeof(TEST_DATA.mac));
+                         buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
+                memcpy(paired_receiver_mac, buf + 1, sizeof(paired_receiver_mac));
+                memcpy(message + 8, paired_receiver_mac, 6);
                 paired = true;
             }
         }
@@ -363,7 +360,7 @@ data processor task resumes it.
 static void heartbeat_receiver_task()
 {
     // vTaskSuspend(NULL);
-    uint8_t buf[sizeof(heartbeat_data_t)];
+    uint8_t buf[sizeof(message)];
     while (1)
     {
         if (xSemaphore != NULL)
@@ -375,14 +372,13 @@ static void heartbeat_receiver_task()
                 lora_receive(); // put into receive mode
                 if (lora_received())
                 {
-                    int rxLen = lora_receive_packet(buf, sizeof(heartbeat_data_t));
+                    int rxLen = lora_receive_packet(buf, sizeof(message));
                     int rssi = lora_packet_rssi();
-                    heartbeat_data_t *evt = (heartbeat_data_t *)buf;
-                    if (xQueueSend(event_action_queue, evt, 128) != pdTRUE)
+                    if (xQueueSend(event_action_queue, buf, 128) != pdTRUE)
                     {
                         ESP_LOGE(TAG, "Failed to send data to queue");
                     }
-                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*d] at %ddbm", rxLen, rxLen, evt->voltage, rssi);
+                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[Message Type%d] at %ddbm", rxLen, rxLen, buf[0], rssi);
                 }
                 xSemaphoreGive(xSemaphore);
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -397,41 +393,42 @@ static void heartbeat_receiver_task()
 
 static void heartbeat_processor_task()
 {
-    heartbeat_data_t evt;
+    uint8_t buf[33] = {0};
     int transmitter_battery_voltages[10] = {0};
     int adc_raw;
     int transmitter_voltage;
-    uint32_t receiver_counter = 0;
+    int receiver_voltage;
     uint32_t transmitter_counter = 0;
     uint16_t average_transmitter_voltages;
     while (1)
     {
         // Receive the heartbeat containing the receivers battery voltage
-        while (xQueueReceive(event_action_queue, &evt, 128) == pdTRUE)
+        while (xQueueReceive(event_action_queue, buf, 128) == pdTRUE)
         {
-            if (memcmp(evt.paired_transmitter_mac, own_mac, sizeof(evt.mac)) == 0 && !paired)
+            if (memcmp(buf + 8, own_mac, sizeof(own_mac)) == 0 && !paired)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
                 vTaskResume(blink_pairing_led_task_handle);
                 paired = true;
-                memcpy(paired_receiver_mac, evt.mac, sizeof(evt.mac));
+                memcpy(paired_receiver_mac, buf + 1, sizeof(paired_receiver_mac));
                 vTaskResume(input_processor_task_handle);
                 vTaskDelete(pairing_task_handle);
             }
-            else if (memcmp(evt.mac, paired_receiver_mac, sizeof(evt.mac)) != 0)
+            else if (memcmp(buf + 1, paired_receiver_mac, sizeof(paired_receiver_mac)) != 0 || buf[0] != 2)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
-            ESP_LOGI(pcTaskGetName(NULL), "RECEIVED TRANSMITTER VOLTAGE: %d", evt.voltage);
-            if ((evt.voltage) < (int)(BATTERY_LOW / 5))
+            receiver_voltage = (buf[14] << 24) + (buf[15] << 16) + (buf[16] << 8) + (buf[17]);
+            ESP_LOGI(pcTaskGetName(NULL), "RECEIVED receiver VOLTAGE: %d", receiver_voltage);
+            if (receiver_voltage < (int)(BATTERY_LOW / 5))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
                 voltage_state |= 0x1u;
                 // gpio_set_level(BATTERY_STATUS_LED, 1);
             }
-            else if ((evt.voltage) > (int)(BATTERY_LOW / 5))
+            else if (receiver_voltage > (int)(BATTERY_LOW / 5))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
                 voltage_state &= ~(0x1u);
@@ -529,7 +526,7 @@ void app_main()
         TEST_DATA.toggle_state = true;
     }
 
-    event_action_queue = xQueueCreate(10, sizeof(heartbeat_data_t));
+    event_action_queue = xQueueCreate(10, sizeof(message));
 
     if (event_action_queue == NULL)
     {

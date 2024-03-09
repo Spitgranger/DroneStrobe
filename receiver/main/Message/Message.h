@@ -13,22 +13,31 @@
  */
 typedef struct Data_t
 {
+    uint8_t current_state;
+    bool momentary_state;
+    bool on_state;
+    bool strobe_state;
+} generic_data_t;
+
+typedef struct received_t
+{
     bool button_one_state;
     bool button_two_state;
     bool toggle_state;
     unsigned char mac[6];
     uint8_t paired_receiver_mac[6];
-} generic_data_t;
+} received_data_t;
 
 typedef struct Pairing_Data_t
 {
     unsigned char mac[6];
-    char pairing_key[16];
+    char pairing_key[17];
+    char paired_receiver_mac[6];
 } pairing_data_t;
 
 typedef struct Heartbeat_Data_t
 {
-    int raw_adc;
+    int adc_raw;
     int voltage;
     uint8_t mac[6];
     uint8_t paired_transmitter_mac[6];
@@ -42,7 +51,7 @@ extern uint8_t message[33];
  * @param data generic_data_t * Pointer to the data structure holding the current state of the buttons set in input processor.
  * @return void
  */
-void build_transmission_message(generic_data_t *data);
+void build_transmission_message(received_data_t *data);
 
 /**
  * @brief This function constructs the message that contains the pairing key data.

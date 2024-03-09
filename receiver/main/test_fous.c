@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
+#include "Message/Message.h"
 
 #define ESP_INR_FLAG_DEFAULT 0
 #define LEDC_TIMER LEDC_TIMER_0
@@ -62,13 +63,15 @@ TaskHandle_t received_data_processor_handle;
 TaskHandle_t heartbeat_sender_handle;
 TaskHandle_t voltage_reader_handle;
 // Instead of blocking the cpu on the received callback, send the data to a queue to be processed by a lower priority task
-static QueueHandle_t s_example_espnow_queue;
+static QueueHandle_t transmitter_message_queue;
 static unsigned char paired_mac[6];
-static const char *PAIRING_KEY = "789eebEkksXswqwe";
+static const char *PAIRING_KEY = "789eebEkksXswqw";
 static uint64_t last_brightness_press = 0;
 static int receiver_battery_voltages[10] = {0};
 static bool paired = false;
 static uint8_t own_mac[6];
+// Byte array to store all messages transmitted
+uint8_t message[33] = {0};
 
 // adc battery voltage monitoring
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
@@ -86,38 +89,6 @@ static adc_oneshot_chan_cfg_t config = {
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
 static bool do_calibration1_chan0;
 
-typedef struct Data_t
-{
-    uint8_t current_state;
-    bool momentary_state;
-    bool on_state;
-    bool strobe_state;
-} generic_data_t;
-
-typedef struct received_t
-{
-    bool button_one_state;
-    bool button_two_state;
-    bool toggle_state;
-    unsigned char mac[6];
-    uint8_t paired_receiver_mac[6];
-} received_data_t;
-
-typedef struct Pairing_Data_t
-{
-    unsigned char mac[6];
-    char pairing_key[17];
-    char paired_receiver_mac[6];
-} pairing_data_t;
-
-typedef struct Heartbeat_Data_t
-{
-    int adc_raw;
-    int voltage;
-    uint8_t mac[6];
-    uint8_t paired_transmitter_mac[6];
-} heartbeat_data_t;
-
 static generic_data_t TEST_DATA = {0, false, false, false};
 static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqw", {0}};
 
@@ -132,42 +103,42 @@ static void adc_init();
 static void received_data_processor(void *pvParameter)
 {
     vTaskSuspend(NULL);
-    received_data_t evt;
+    uint8_t buf[33] = {0};
     generic_data_t *data = (generic_data_t *)pvParameter;
     uint64_t brightness_button_time_difference = 0;
     // Loop to process receieved data and update the programs state
     while (1)
     {
         // If there are messages in the queue, processes them else yield the CPU back to the scheduler
-        while (xQueueReceive(s_example_espnow_queue, &evt, ESP_MAXDELAY) == pdTRUE)
+        while (xQueueReceive(transmitter_message_queue, buf, ESP_MAXDELAY) == pdTRUE)
         {
             vTaskSuspend(voltage_reader_handle);
-            if (memcmp(evt.mac, paired_mac, sizeof(evt.mac)) != 0)
+            if (memcmp(buf + 1, paired_mac, sizeof(paired_mac)) != 0)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid mac or unpaired device, message not read");
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
 
-            if (evt.button_one_state == 1 && evt.button_two_state == 1)
+            if ((buf[14] & 0x1) && (buf[14] & (0x1 << 1)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Strobing");
                 data->strobe_state = true;
             }
-            else if (evt.button_one_state == 0 && evt.button_two_state == 1 && evt.toggle_state == 1)
+            else if (!(buf[14] & 0x1) && (buf[14] & (0x1 << 1)) && (buf[14] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Momentary state ON LED ON");
                 data->on_state = true;
                 data->momentary_state = true;
             }
-            else if (evt.button_one_state == 0 && evt.button_two_state == 0 && evt.toggle_state == 1)
+            else if (!(buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && (buf[14] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY STATE LED OFF");
                 data->momentary_state = true;
                 data->on_state = false;
                 data->strobe_state = false;
             }
-            else if (evt.button_one_state == 1 && evt.button_two_state == 0 && evt.toggle_state == 0)
+            else if ((buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && !(buf[14] & (0x1 << 2)))
             {
                 // This timeout is needed as the transmitter sends quickly (75ms) pressing the brightness button can cause the state to change to quickly.
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
@@ -182,7 +153,7 @@ static void received_data_processor(void *pvParameter)
                 // the user needing to release the button for at least a second to change state again same below
                 last_brightness_press = esp_timer_get_time();
             }
-            else if (evt.button_one_state == 1)
+            else if (buf[14] & 0x1)
             {
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
                 if (brightness_button_time_difference / 1000ULL > 110)
@@ -192,7 +163,7 @@ static void received_data_processor(void *pvParameter)
                 }
                 last_brightness_press = esp_timer_get_time();
             }
-            else if (evt.button_one_state == 0 && evt.button_two_state == 0 && evt.toggle_state == 0)
+            else if (!(buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && !(buf[14] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY MODE, LIGHTS ON");
                 data->on_state = true;
@@ -265,7 +236,7 @@ static void high_power_ledc_init(void)
 
 static void pairing_task(void *pvParameter)
 {
-    uint8_t buf[sizeof(pairing_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
+    uint8_t buf[sizeof(message)]; // Maximum Payload size of SX1276/77/78/79 is 255
     while (1)
     {
         lora_receive(); // put into receive mode
@@ -274,28 +245,35 @@ static void pairing_task(void *pvParameter)
             int rxLen = lora_receive_packet(buf, sizeof(buf));
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-            pairing_data_t *evt = (pairing_data_t *)buf;
+            for (uint8_t i = 0; i < sizeof(buf); ++i)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "%02x", buf[i]);
+            } 
             // This is to ensure that the receiver knows the state of any paired transmitter. If its own power is lost it will automatically repair
             // to the previously paired transmitter
             // TODO: check if this works at the structures are different.
-            if (memcmp(evt->paired_receiver_mac, own_mac, sizeof(own_mac)) == 0 && !paired)
+            print_mac(own_mac);
+            if (memcmp(buf + 8, own_mac, sizeof(own_mac)) == 0 && !paired)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
             }
-            else if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) != 0)
+            else if (memcmp(buf + 14, PAIRING_KEY, 16) != 0 || (buf[0] != 1))
             {
-                ESP_LOGI(pcTaskGetName(NULL), "Invalid pairing key, message not read");
+                ESP_LOGI(pcTaskGetName(NULL), "Invalid pairing key or message, message not read");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            memcpy(paired_mac, evt->mac, sizeof(evt->mac));
+            memcpy(paired_mac, buf + 1, sizeof(paired_mac));
+            build_pairing_message(PAIRING_KEY);
+            memcpy(message + 8, paired_mac, 6);
             ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
-                     evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+                     buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
             paired = true;
+            message[0] = 0x1;
             // Send the received mac address back to the transmitter, to acknowledge the pairing (do this 10 times to ensure that it is received)
-            for (uint8_t i = 0; i < 20; ++i)
+            for (uint8_t i = 0; i < 15; ++i)
             {
-                lora_send_packet((uint8_t *)&PAIRING_DATA, sizeof(pairing_data_t));
+                lora_send_packet(message, sizeof(message));
             }
             // After pairing, flash led for 1 second
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
@@ -322,18 +300,17 @@ void lora_task_receiver(void *pvParameter)
     // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
 
-    uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
+    uint8_t buf[sizeof(message)]; // Maximum Payload size of SX1276/77/78/79 is 255
     unsigned long last_sent = 0;
     while (1)
     {
         lora_receive(); // put into receive mode
         if (lora_received())
         {
-            int rxLen = lora_receive_packet(buf, sizeof(received_data_t));
+            int rxLen = lora_receive_packet(buf, sizeof(message));
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-            received_data_t *evt = (received_data_t *)buf;
-            if (xQueueSend(s_example_espnow_queue, evt, ESP_MAXDELAY) != pdTRUE)
+            if (xQueueSend(transmitter_message_queue, buf, ESP_MAXDELAY) != pdTRUE)
             {
                 ESP_LOGE(TAG, "Failed to send data to queue");
             }
@@ -396,11 +373,7 @@ static void heartbeat_sender_task(void *pvParameter)
 {
     vTaskSuspend(NULL);
     ESP_LOGI(pcTaskGetName(NULL), "Start sending heartbeat");
-    heartbeat_data_t data;
     int voltage;
-    esp_read_mac(data.mac, ESP_MAC_WIFI_STA);
-    memcpy(data.paired_transmitter_mac, paired_mac, sizeof(paired_mac));
-
     while (1)
     {
         voltage = 0;
@@ -418,11 +391,10 @@ static void heartbeat_sender_task(void *pvParameter)
         }
         voltage /= 10;
         ESP_LOGI(pcTaskGetName(NULL), "Sending heartbeat");
-        data.adc_raw = 0;
-        data.voltage = voltage;
+        build_heartbeat_messages(voltage);
         for (int i = 0; i < 5; i++)
         {
-            lora_send_packet((uint8_t *)&data, sizeof(heartbeat_data_t));
+            lora_send_packet(message, sizeof(message));
         }
         vTaskResume(lora_receiver_handle);
         vTaskSuspend(NULL);
@@ -461,14 +433,16 @@ void app_main(void)
     // Initialize lora module
     initialize_lora();
 
-    s_example_espnow_queue = xQueueCreate(ESP_QUEUE_SIZE, sizeof(received_data_t));
-    if (s_example_espnow_queue == NULL)
+    transmitter_message_queue = xQueueCreate(ESP_QUEUE_SIZE, sizeof(message));
+    if (transmitter_message_queue == NULL)
     {
-        ESP_LOGE(TAG, "Create mutex fail");
+        ESP_LOGE(TAG, "Queue Creation Failed");
     }
 
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
     esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
+    // Copy our own mac into the first 6 bytes of message to identify the sender of this message
+    memcpy(message + 1, own_mac, 6);
     xTaskCreatePinnedToCore(pairing_task, "Pairing", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(listener, "Listener", 4000, (void *)&TEST_DATA, 5, &listener_handle, 1);
     xTaskCreatePinnedToCore(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 6, &lora_receiver_handle, 0);
