@@ -5,6 +5,7 @@
     GPIO 22 = Toggle switch
     GPIO 7  = ADC1 CHANNEL 6 PIN used for battery voltage measuring the full voltage 12.6 is divided by 5.
 */
+// Might have to change everything to a fixed format ie (header info) (button data) (heartbeat data)
 // TODO Debounce buttons, fix logic when momentary state is changed, implement rolling code decryption
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +42,8 @@
 #define LEDC_DUTY_35 (128)
 #define LEDC_DUTY_0 0
 #define LEDC_DUTY_20 (51)
+#define LEDC_DUTY_10 (32)
+#define LEDC_DUTY_5 (16)
 #define LEDC_FREQUENCY (800) // Frequency in Hertz. Set frequency at 800 Hz
 #define BUTTON1 15
 #define BUTTON2 23
@@ -64,6 +67,8 @@ static unsigned char paired_mac[6];
 static const char *PAIRING_KEY = "789eebEkksXswqwe";
 static uint64_t last_brightness_press = 0;
 static int receiver_battery_voltages[10] = {0};
+static bool paired = false;
+static uint8_t own_mac[6];
 
 // adc battery voltage monitoring
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
@@ -95,13 +100,14 @@ typedef struct received_t
     bool button_two_state;
     bool toggle_state;
     unsigned char mac[6];
-    char pairing_key[6];
+    uint8_t paired_receiver_mac[6];
 } received_data_t;
 
 typedef struct Pairing_Data_t
 {
     unsigned char mac[6];
     char pairing_key[17];
+    char paired_receiver_mac[6];
 } pairing_data_t;
 
 typedef struct Heartbeat_Data_t
@@ -113,7 +119,7 @@ typedef struct Heartbeat_Data_t
 } heartbeat_data_t;
 
 static generic_data_t TEST_DATA = {0, false, false, false};
-static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqwe"};
+static pairing_data_t PAIRING_DATA = {{0}, "789eebEkksXswqw", {0}};
 
 // static const char *PMK_KEY = "789eebEkksXswqwe";
 // static const char *LMK_KEY = "36ddee7ae14htdi6";
@@ -269,7 +275,14 @@ static void pairing_task(void *pvParameter)
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
             pairing_data_t *evt = (pairing_data_t *)buf;
-            if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) != 0)
+            // This is to ensure that the receiver knows the state of any paired transmitter. If its own power is lost it will automatically repair
+            // to the previously paired transmitter
+            // TODO: check if this works at the structures are different.
+            if (memcmp(evt->paired_receiver_mac, own_mac, sizeof(own_mac)) == 0 && !paired)
+            {
+                ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
+            }
+            else if (memcmp(evt->pairing_key, PAIRING_KEY, sizeof(evt->pairing_key)) != 0)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid pairing key, message not read");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -278,6 +291,7 @@ static void pairing_task(void *pvParameter)
             memcpy(paired_mac, evt->mac, sizeof(evt->mac));
             ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                      evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+            paired = true;
             // Send the received mac address back to the transmitter, to acknowledge the pairing (do this 10 times to ensure that it is received)
             for (uint8_t i = 0; i < 20; ++i)
             {
@@ -307,7 +321,6 @@ void lora_task_receiver(void *pvParameter)
     vTaskSuspend(NULL);
     // uint64_t messages_received = 0;
     ESP_LOGI(pcTaskGetName(NULL), "Start receiving data");
-    heartbeat_data_t data;
 
     uint8_t buf[sizeof(received_data_t)]; // Maximum Payload size of SX1276/77/78/79 is 255
     unsigned long last_sent = 0;
@@ -455,6 +468,7 @@ void app_main(void)
     }
 
     esp_read_mac(PAIRING_DATA.mac, ESP_MAC_WIFI_STA);
+    esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
     xTaskCreatePinnedToCore(pairing_task, "Pairing", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(listener, "Listener", 4000, (void *)&TEST_DATA, 5, &listener_handle, 1);
     xTaskCreatePinnedToCore(&lora_task_receiver, "RX", 1024 * 3, (void *)&TEST_DATA, 6, &lora_receiver_handle, 0);
@@ -514,18 +528,24 @@ void listener(void *xStruct)
                 ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
                 // Update duty to apply the new value
                 ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_20));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
                 break;
             case 1:
                 // Set duty to 35%
                 ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_35));
                 // Update duty to apply the new value
                 ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_10));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
                 break;
             case 2:
                 // Set duty to 15%
                 ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_15));
                 // Update duty to apply the new value
                 ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL, LEDC_DUTY_5));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_HIGH_POWER_CHANNEL));
                 break;
             default:
                 break;
