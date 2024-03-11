@@ -378,7 +378,7 @@ static void heartbeat_receiver_task()
                     {
                         ESP_LOGE(TAG, "Failed to send data to queue");
                     }
-                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[Message Type%d] at %ddbm", rxLen, rxLen, buf[0], rssi);
+                    ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[Message Type %u] at %ddbm", rxLen, buf[0], rssi);
                 }
                 xSemaphoreGive(xSemaphore);
                 vTaskDelay(pdMS_TO_TICKS(50));
