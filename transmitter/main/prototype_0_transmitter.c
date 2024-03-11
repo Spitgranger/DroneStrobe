@@ -27,7 +27,7 @@
 #define BATTERY_STATUS_LED 10
 #define ESP_INTR_FLAG_DEFAULT 0
 #define BATTERY_MAX 12600
-#define BATTERY_LOW 10500
+#define BATTERY_LOW 10000
 #define BATTERY_MIN 10100
 #define BATTERY_ADC1_CHAN0 ADC_CHANNEL_6
 #define ADC_ATTEN ADC_ATTEN_DB_12
@@ -267,12 +267,12 @@ void pairing_task(void *pvParameter)
             int rxLen = lora_receive_packet(buf, sizeof(message));
             int rssi = lora_packet_rssi();
             ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s] at %ddbm", rxLen, rxLen, buf, rssi);
-            if (memcmp(buf + 14, PAIRING_KEY, 16) == 0 && buf[0] == 1)
+            if (memcmp(buf + 13, PAIRING_KEY, 16) == 0 && buf[0] == 1)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                          buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
                 memcpy(paired_receiver_mac, buf + 1, sizeof(paired_receiver_mac));
-                memcpy(message + 8, paired_receiver_mac, 6);
+                memcpy(message + 7, paired_receiver_mac, 6);
                 paired = true;
             }
         }
@@ -405,7 +405,7 @@ static void heartbeat_processor_task()
         // Receive the heartbeat containing the receivers battery voltage
         while (xQueueReceive(event_action_queue, buf, 128) == pdTRUE)
         {
-            if (memcmp(buf + 8, own_mac, sizeof(own_mac)) == 0 && !paired)
+            if (memcmp(buf + 7, own_mac, sizeof(own_mac)) == 0 && !paired)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
                 vTaskResume(blink_pairing_led_task_handle);
@@ -420,7 +420,7 @@ static void heartbeat_processor_task()
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
-            receiver_voltage = (buf[14] << 24) + (buf[15] << 16) + (buf[16] << 8) + (buf[17]);
+            receiver_voltage = (buf[13] << 24) + (buf[14] << 16) + (buf[15] << 8) + (buf[16]);
             ESP_LOGI(pcTaskGetName(NULL), "RECEIVED receiver VOLTAGE: %d", receiver_voltage);
             if (receiver_voltage < (int)(BATTERY_LOW / 5))
             {

@@ -32,23 +32,23 @@ void build_transmission_message(generic_data_t *data)
         state_byte &= ~(0x1 << 2);
     }
     message[0] = 0x0;
-    message[14] = state_byte;
+    message[13] = state_byte;
     return;
 }
 
 void build_pairing_message(const char *pairing_key)
 {
     // Copies the pairing key into the 13 position of the byte array
-    memcpy(message + 14, pairing_key, 16);
+    memcpy(message + 13, pairing_key, 16);
     // Set the message id byte equal to 1
     message[0] = 1;
 }
 
 void build_heartbeat_message(int voltage)
 {
-    message[14] = (voltage >> 24) & 0xFF;
-    message[15] = (voltage >> 16) & 0xFF;
-    message[16] = (voltage >> 8) & 0xFF; 
-    message[17] = voltage & 0xFF;
+    message[13] = (voltage >> 24) & 0xFF;
+    message[14] = (voltage >> 16) & 0xFF;
+    message[15] = (voltage >> 8) & 0xFF; 
+    message[16] = voltage & 0xFF;
     message[0] = 2;
 }

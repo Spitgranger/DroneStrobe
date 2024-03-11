@@ -120,25 +120,25 @@ static void received_data_processor(void *pvParameter)
                 continue;
             }
 
-            if ((buf[14] & 0x1) && (buf[14] & (0x1 << 1)))
+            if ((buf[13] & 0x1) && (buf[13] & (0x1 << 1)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Strobing");
                 data->strobe_state = true;
             }
-            else if (!(buf[14] & 0x1) && (buf[14] & (0x1 << 1)) && (buf[14] & (0x1 << 2)))
+            else if (!(buf[13] & 0x1) && (buf[13] & (0x1 << 1)) && (buf[13] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Momentary state ON LED ON");
                 data->on_state = true;
                 data->momentary_state = true;
             }
-            else if (!(buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && (buf[14] & (0x1 << 2)))
+            else if (!(buf[13] & 0x1) && !(buf[13] & (0x1 << 1)) && (buf[13] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY STATE LED OFF");
                 data->momentary_state = true;
                 data->on_state = false;
                 data->strobe_state = false;
             }
-            else if ((buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && !(buf[14] & (0x1 << 2)))
+            else if ((buf[13] & 0x1) && !(buf[13] & (0x1 << 1)) && !(buf[13] & (0x1 << 2)))
             {
                 // This timeout is needed as the transmitter sends quickly (75ms) pressing the brightness button can cause the state to change to quickly.
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
@@ -153,7 +153,7 @@ static void received_data_processor(void *pvParameter)
                 // the user needing to release the button for at least a second to change state again same below
                 last_brightness_press = esp_timer_get_time();
             }
-            else if (buf[14] & 0x1)
+            else if (buf[13] & 0x1)
             {
                 brightness_button_time_difference = esp_timer_get_time() - last_brightness_press;
                 if (brightness_button_time_difference / 1000ULL > 110)
@@ -163,7 +163,7 @@ static void received_data_processor(void *pvParameter)
                 }
                 last_brightness_press = esp_timer_get_time();
             }
-            else if (!(buf[14] & 0x1) && !(buf[14] & (0x1 << 1)) && !(buf[14] & (0x1 << 2)))
+            else if (!(buf[13] & 0x1) && !(buf[13] & (0x1 << 1)) && !(buf[13] & (0x1 << 2)))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "MOMENTARY MODE, LIGHTS ON");
                 data->on_state = true;
@@ -251,13 +251,11 @@ static void pairing_task(void *pvParameter)
             } 
             // This is to ensure that the receiver knows the state of any paired transmitter. If its own power is lost it will automatically repair
             // to the previously paired transmitter
-            // TODO: check if this works at the structures are different.
-            print_mac(own_mac);
-            if (memcmp(buf + 8, own_mac, sizeof(own_mac)) == 0 && !paired)
+            if (memcmp(buf + 7, own_mac, sizeof(own_mac)) == 0 && !paired)
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Connection Restarted");
             }
-            else if (memcmp(buf + 14, PAIRING_KEY, 16) != 0 || (buf[0] != 1))
+            else if (memcmp(buf + 13, PAIRING_KEY, 16) != 0 || (buf[0] != 1))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "Invalid pairing key or message, message not read");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -265,7 +263,7 @@ static void pairing_task(void *pvParameter)
             }
             memcpy(paired_mac, buf + 1, sizeof(paired_mac));
             build_pairing_message(PAIRING_KEY);
-            memcpy(message + 8, paired_mac, 6);
+            memcpy(message + 7, paired_mac, 6);
             ESP_LOGI(pcTaskGetName(NULL), "Paired with %02x:%02x:%02x:%02x:%02x:%02x",
                      buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
             paired = true;
