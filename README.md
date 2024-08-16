@@ -1,6 +1,12 @@
-# ESP32 remote light prototype
+# ESP32 Remote Light
 
-Fully remote controlled multifunction light with secured RF connection. Up to 7KM of range. Broadcasting on ISM 915MHz.
+Fully remote controlled multifunction light with secured RF connection. Up to 7KM of range. Broadcasting on ISM 915MHz. Preferred hardware is a dual core ESP32-S3 and RFM95W LoRA chip.
+
+## Features
+- Battery status monitoring (Voltage based)
+- AdHoc pairing.
+- Support for many to one connections (recivers to transmitters)
+
 
 ## Build
 
@@ -14,13 +20,12 @@ $ idf.py -p <port to serial device> flash
 ### Known Issues / Improvements
 - Buttons are bouncy, need to be hardware debounced or software needs to be changed.
 - Need to verify the implementation of the listener task, as interrupts are passing events to queue, may have potential implications when more than one button is pressed
+- Since LoRA is a half duplex system, receiving and transmitting at the same time is not possible. We therefore always send heartbeat messages every 20 seconds interrupting the receiver's receive task. This works most of the time, but if a more robust solution can be created the better
 
 ### TODO
-
-- Set up remote pairing system
+- ~~Set up remote pairing system~~
 - Add nonce based encryption to messages sent (used calculate HMAC?)
 - Brightness button control is weird. (Maybe button needs to be hardware debounced)
-- 
 
 ### Switch and LED Pin Configurations
 |Device|ESP32 Transmitter|ESP32 Receiver|
