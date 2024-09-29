@@ -26,9 +26,9 @@
 #define PAIRING_LED 11
 #define BATTERY_STATUS_LED 10
 #define ESP_INTR_FLAG_DEFAULT 0
-#define BATTERY_MAX 12600
-#define BATTERY_LOW 10000
-#define BATTERY_MIN 10100
+#define BATTERY_MAX 8400
+#define BATTERY_LOW 7400
+#define BATTERY_MIN 6400
 #define BATTERY_ADC1_CHAN0 ADC_CHANNEL_6
 #define ADC_ATTEN ADC_ATTEN_DB_12
 #define TRANSMITTER_BATTERY_MAX 4200
@@ -422,13 +422,13 @@ static void heartbeat_processor_task()
             }
             receiver_voltage = (buf[13] << 24) + (buf[14] << 16) + (buf[15] << 8) + (buf[16]);
             ESP_LOGI(pcTaskGetName(NULL), "RECEIVED receiver VOLTAGE: %d", receiver_voltage);
-            if (receiver_voltage < (int)(BATTERY_LOW / 5))
+            if (receiver_voltage < (int)(BATTERY_LOW / 3))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "BATTERY LOW");
                 voltage_state |= 0x1u;
                 // gpio_set_level(BATTERY_STATUS_LED, 1);
             }
-            else if (receiver_voltage > (int)(BATTERY_LOW / 5))
+            else if (receiver_voltage > (int)(BATTERY_LOW / 3))
             {
                 ESP_LOGI(pcTaskGetName(NULL), "BATTERY OK");
                 voltage_state &= ~(0x1u);
