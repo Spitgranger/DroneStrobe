@@ -142,9 +142,9 @@ void process_input(void *pvParameter)
                         }
                     }
                     vTaskResume(transmitter_task_handle);
-                    brightness_button_level = gpio_get_level(BUTTON1);
-                    momentary_button_level = gpio_get_level(BUTTON2);
-                    toggle_switch_level = gpio_get_level(TOGGLE);
+                    brightness_button_level = !gpio_get_level(BUTTON1);
+                    momentary_button_level = !gpio_get_level(BUTTON2);
+                    toggle_switch_level = !gpio_get_level(TOGGLE);
                     if (last_pressed == 0 && brightness_button_level == 1)
                     {
                         pressed_time = esp_timer_get_time();
